@@ -1,0 +1,46 @@
+platform: openclaw
+
+skills:
+  orchestrator:
+    enabled: true
+    path: .skills/orchestrator
+    command: /orchestrator
+  
+  bmad-evo:
+    enabled: true
+    path: .skills/bmad-evo
+    command: /bmad-evo
+  
+  spec-kit:
+    enabled: true
+    path: .skills/spec-kit
+    command: /spec-kit
+  
+  superpowers:
+    enabled: true
+    path: .skills/superpowers
+    command: /superpowers
+  
+  multi-agent-pipeline:
+    enabled: true
+    path: .skills/multi-agent-pipeline
+    command: /multi-agent-pipeline
+
+routing_rules:
+  simple:
+    - spec-kit
+    - superpowers
+  
+  complex:
+    - bmad-evo
+    - multi-agent-pipeline
+    - spec-kit
+    - superpowers
+  
+  auto:
+    - orchestrator
+
+execution:
+  max_parallel_tasks: 5
+  timeout: 600
+  max_retries: 3

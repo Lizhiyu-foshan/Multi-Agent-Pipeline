@@ -1,0 +1,39 @@
+skills:
+  orchestrator:
+    enabled: true
+    path: .skills/orchestrator
+  
+  bmad-evo:
+    enabled: true
+    path: .skills/bmad-evo
+  
+  spec-kit:
+    enabled: true
+    path: .skills/spec-kit
+  
+  superpowers:
+    enabled: true
+    path: .skills/superpowers
+  
+  multi-agent-pipeline:
+    enabled: true
+    path: .skills/multi-agent-pipeline
+
+routing_rules:
+  simple:
+    - spec-kit
+    - superpowers
+  
+  complex:
+    - bmad-evo
+    - multi-agent-pipeline
+    - spec-kit
+    - superpowers
+  
+  auto:
+    - orchestrator  # 自动选择
+
+execution:
+  max_parallel_tasks: 5
+  timeout: 600
+  max_retries: 3

@@ -1,0 +1,45 @@
+platform: opencode
+
+skills:
+  orchestrator:
+    enabled: true
+    path: .skills/orchestrator
+    command: /orchestrator
+  
+  bmad-evo:
+    enabled: true
+    path: ../bmad-evo
+    command: /bmad-evo
+  
+  spec-kit:
+    enabled: true
+    path: ../speckit
+    command: /spec-kit
+  
+  superpowers:
+    enabled: true
+    path: ../superpowers
+  
+  multi-agent-pipeline:
+    enabled: true
+    path: ../multi-agent-pipeline
+    command: /multi-agent-pipeline
+
+routing_rules:
+  simple:
+    - spec-kit
+    - superpowers
+  
+  complex:
+    - bmad-evo
+    - multi-agent-pipeline
+    - spec-kit
+    - superpowers
+  
+  auto:
+    - orchestrator
+
+execution:
+  max_parallel_tasks: 5
+  timeout: 600
+  max_retries: 3
