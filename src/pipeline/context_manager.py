@@ -11,6 +11,7 @@ Prevents context explosion during 3-5 hour runs by:
 import json
 import logging
 import os
+import re
 import tempfile
 import threading
 import time
@@ -38,6 +39,26 @@ ENTRY_IMPORTANCE = {
     "evolve": 4,
     "verify": 7,
     "orchestrator": 3,
+}
+
+SENSITIVE_PATTERNS = [
+    re.compile(r"(?i)(api[_-]?key\s*[:=]\s*)([^\s,;]+)"),
+    re.compile(r"(?i)(token\s*[:=]\s*)([^\s,;]+)"),
+    re.compile(r"(?i)(password\s*[:=]\s*)([^\s,;]+)"),
+    re.compile(r"(?i)(secret\s*[:=]\s*)([^\s,;]+)"),
+    re.compile(r"(?i)(authorization\s*[:=]\s*bearer\s+)([^\s,;]+)"),
+]
+
+SENSITIVE_KEYS = {
+    "api_key",
+    "apikey",
+    "token",
+    "access_token",
+    "refresh_token",
+    "password",
+    "secret",
+    "authorization",
+    "auth",
 }
 
 
@@ -293,7 +314,7 @@ class ContextManager:
                 "task_id": entry.task_id,
                 "role_id": entry.role_id,
                 "phase": entry.phase,
-                "content": entry.content[:1000],
+                "content": self._redact_text(entry.content)[:1000],
                 "timestamp": entry.timestamp,
             },
             ensure_ascii=False,
@@ -322,10 +343,34 @@ class ContextManager:
             self._snapshot_pipelines()
             artifacts_file = self.state_dir / "artifacts.json"
             try:
+                redacted_artifacts = self._redact_value(self._artifacts)
                 with open(artifacts_file, "w", encoding="utf-8") as f:
-                    json.dump(self._artifacts, f, ensure_ascii=False, indent=2)
+                    json.dump(redacted_artifacts, f, ensure_ascii=False, indent=2)
             except Exception as e:
                 logger.debug(f"Failed to save artifacts state: {e}")
+
+    def _redact_text(self, text: str) -> str:
+        if not isinstance(text, str) or not text:
+            return text
+        out = text
+        for p in SENSITIVE_PATTERNS:
+            out = p.sub(lambda m: f"{m.group(1)}***REDACTED***", out)
+        return out
+
+    def _redact_value(self, value: Any) -> Any:
+        if isinstance(value, dict):
+            redacted = {}
+            for k, v in value.items():
+                if str(k).lower() in SENSITIVE_KEYS:
+                    redacted[k] = "***REDACTED***"
+                else:
+                    redacted[k] = self._redact_value(v)
+            return redacted
+        if isinstance(value, list):
+            return [self._redact_value(v) for v in value]
+        if isinstance(value, str):
+            return self._redact_text(value)
+        return value
 
     def load_state(self):
         artifacts_file = self.state_dir / "artifacts.json"

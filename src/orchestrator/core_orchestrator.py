@@ -403,9 +403,9 @@ class CoreOrchestrator:
             task_description or "Please improve the previous output based on feedback"
         )
 
+        loop_evaluator = self.evaluator
         if decision == "B":
-            self.evaluator = ExecutionEvaluator(spec_gate=None)
-            self.agent_loop.evaluator = self.evaluator
+            loop_evaluator = ExecutionEvaluator(spec_gate=None)
 
         active_service = None
         pre = self.spec_gate.pre_inject(skill_name, desc, None)
@@ -419,7 +419,18 @@ class CoreOrchestrator:
             "relaxed_constraints": decision == "B",
         }
 
-        outcome = self.agent_loop.run(
+        loop_config = self.loop_policy.get_config(
+            level=ExecutionLevel.SYSTEM,
+            role_type=skill_name,
+            skill_name=skill_name,
+        )
+        agent_loop = AgentLoop(
+            evaluator=loop_evaluator,
+            max_iterations=loop_config.max_iterations,
+            pass_threshold=loop_config.pass_threshold,
+        )
+
+        outcome = agent_loop.run(
             task_description=desc,
             skill_name=skill_name,
             skill_execute_fn=lambda d, ctx: skill_adapter.execute(

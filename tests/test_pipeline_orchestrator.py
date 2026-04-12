@@ -556,5 +556,141 @@ class TestMetricsInstrumentation:
         assert m["tasks"]["completed"] + m["tasks"]["failed"] >= 1
 
 
+class TestCheckpointTaskSnapshot:
+    def test_create_checkpoint_stores_full_task_list(self, orchestrator):
+        pipeline, _ = orchestrator.create_pipeline("checkpoint task snapshot")
+        orchestrator.scheduler.registry.register("developer", "Dev", ["code"])
+
+        t1 = orchestrator.scheduler.submit_task(
+            {
+                "pipeline_id": pipeline.id,
+                "role_id": "developer",
+                "name": "Task A",
+                "description": "A",
+                "priority": "P1",
+                "depends_on": [],
+            }
+        )
+        task_obj = orchestrator.scheduler.task_queue.get(t1["task_id"])
+        assert task_obj is not None
+
+        orchestrator._create_checkpoint(pipeline, label="task_snapshot")
+        latest = orchestrator.checkpoint_mgr.restore_latest(pipeline.id)
+        assert latest is not None
+        snap = latest.get("snapshot", {})
+        tq = snap.get("task_queue_snapshot", {})
+        assert isinstance(tq, dict)
+        assert "tasks" in tq
+        assert isinstance(tq["tasks"], list)
+        assert any(t.get("id") == task_obj.id for t in tq["tasks"])
+
+    def test_recover_tasks_from_stats_only_snapshot_no_crash(self, orchestrator):
+        pipeline, _ = orchestrator.create_pipeline("stats only snapshot")
+        orchestrator._recover_tasks_from_snapshot(
+            pipeline, {"pending": 2, "completed": 1}
+        )
+        # Should no-op without exception
+        assert True
+
+
+class TestParallelPendingModelRequest:
+    class _PendingSkill:
+        def execute(self, prompt, context):
+            return {
+                "success": True,
+                "artifacts": {"partial": "ok"},
+                "pending_model_request": {
+                    "type": "chat",
+                    "prompt": "Need model continuation",
+                },
+            }
+
+    def test_parallel_pending_does_not_complete_tasks(self, orchestrator):
+        orchestrator.register_skill("pending-skill", self._PendingSkill())
+        orchestrator.scheduler.registry.register("developer", "Dev", ["code"])
+
+        pipeline, _ = orchestrator.create_pipeline("parallel pending test")
+        pipeline.phase = PipelinePhase.EXECUTE
+        pipeline.state = PipelineState.RUNNING
+
+        t1 = orchestrator.scheduler.submit_task(
+            {
+                "pipeline_id": pipeline.id,
+                "role_id": "developer",
+                "name": "Task 1",
+                "description": "d1",
+                "priority": "P1",
+                "depends_on": [],
+            }
+        )
+        t2 = orchestrator.scheduler.submit_task(
+            {
+                "pipeline_id": pipeline.id,
+                "role_id": "developer",
+                "name": "Task 2",
+                "description": "d2",
+                "priority": "P1",
+                "depends_on": [],
+            }
+        )
+        pipeline.tasks = [t1["task_id"], t2["task_id"]]
+        orchestrator._save_pipelines()
+
+        ready_tasks = [
+            {
+                "task_id": t1["task_id"],
+                "skill": "pending-skill",
+                "role_id": "developer",
+                "prompt": "do 1",
+            },
+            {
+                "task_id": t2["task_id"],
+                "skill": "pending-skill",
+                "role_id": "developer",
+                "prompt": "do 2",
+            },
+        ]
+
+        result = orchestrator._dispatch_parallel_subagents(pipeline, ready_tasks)
+        assert result is not None
+        assert result.get("action") == "execute_next_task"
+
+        task1 = orchestrator.scheduler.task_queue.get(t1["task_id"])
+        task2 = orchestrator.scheduler.task_queue.get(t2["task_id"])
+        assert task1 is not None and task2 is not None
+        assert task1.status == "pending"
+        assert task2.status == "pending"
+
+
+class TestPendingRequestNormalization:
+    def test_normalize_pending_request_prefers_dict(self, orchestrator):
+        result = {"pending_model_request": {"type": "chat", "prompt": "go"}}
+        pending = orchestrator._normalize_pending_request(result)
+        assert pending["type"] == "chat"
+        assert pending["prompt"] == "go"
+
+    def test_normalize_pending_request_uses_model_request_fallback(self, orchestrator):
+        result = {
+            "pending_model_request": True,
+            "model_request": {"type": "review", "prompt": "continue"},
+        }
+        pending = orchestrator._normalize_pending_request(result)
+        assert pending["type"] == "review"
+        assert pending["prompt"] == "continue"
+
+
+class TestPhaseResultRedaction:
+    def test_safe_phase_result_redacts_sensitive_fields(self, orchestrator):
+        phase_result = {
+            "token": "abc123",
+            "nested": {"api_key": "xyz789"},
+            "ok": "value",
+        }
+        text = orchestrator._safe_phase_result_for_log(phase_result)
+        assert "abc123" not in text
+        assert "xyz789" not in text
+        assert "REDACTED" in text
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

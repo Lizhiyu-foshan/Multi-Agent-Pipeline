@@ -269,10 +269,23 @@ class CheckpointManager:
         ckpt_dir.mkdir(parents=True, exist_ok=True)
         ckpt_file = ckpt_dir / f"{ckpt.id}.json"
         try:
-            with open(ckpt_file, "w", encoding="utf-8") as f:
-                json.dump(
-                    ckpt.to_dict(), f, indent=2, ensure_ascii=False, cls=DateTimeEncoder
-                )
+            fd, tmp = tempfile.mkstemp(dir=str(ckpt_dir), suffix=".json.tmp")
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    json.dump(
+                        ckpt.to_dict(),
+                        f,
+                        indent=2,
+                        ensure_ascii=False,
+                        cls=DateTimeEncoder,
+                    )
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp, str(ckpt_file))
+            except Exception:
+                if os.path.exists(tmp):
+                    os.unlink(tmp)
+                raise
         except Exception as e:
             logger.error(f"Failed to save checkpoint: {e}")
 

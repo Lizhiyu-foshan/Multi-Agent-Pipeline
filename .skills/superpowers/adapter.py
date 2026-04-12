@@ -59,7 +59,8 @@ class Superpowers_Adapter:
         self._hashline_tool = HashlineEditTool(
             backup_dir=os.path.join(self.project_path, ".hashline_backups")
             if self.project_path
-            else None
+            else None,
+            project_root=self.project_path,
         )
         self._code_analyzer = CodeAnalyzer(mode="strict")
 

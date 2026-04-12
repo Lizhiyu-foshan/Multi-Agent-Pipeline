@@ -28,6 +28,8 @@ Flow:
 import json
 import logging
 import os
+import threading
+import tempfile
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -143,6 +145,7 @@ class SessionManager:
     def __init__(self, state_dir: str = None, pipeline_state_fn: Callable = None):
         self._sessions: Dict[str, PromptPassingSession] = {}
         self._pipeline_sessions: Dict[str, str] = {}
+        self._lock = threading.RLock()
         self._state_dir = state_dir
         self._pipeline_state_fn = pipeline_state_fn
         if state_dir:
@@ -150,75 +153,89 @@ class SessionManager:
             self._load_from_disk()
 
     def save(self, session: PromptPassingSession) -> str:
-        session.last_active_at = datetime.now()
-        self._sessions[session.session_id] = session
-        if session.pipeline_id:
-            self._pipeline_sessions[session.pipeline_id] = session.session_id
-        self._persist_to_disk(session)
-        logger.info(
-            f"Session {session.session_id} saved (round {session.round_number}/{session.max_rounds})"
-        )
-        return session.session_id
+        with self._lock:
+            session.last_active_at = datetime.now()
+            self._sessions[session.session_id] = session
+            if session.pipeline_id:
+                self._pipeline_sessions[session.pipeline_id] = session.session_id
+            self._persist_to_disk(session)
+            logger.info(
+                f"Session {session.session_id} saved (round {session.round_number}/{session.max_rounds})"
+            )
+            return session.session_id
 
     def load(self, session_id: str) -> Optional[PromptPassingSession]:
-        session = self._sessions.get(session_id)
-        if not session:
-            return None
-        if session.is_expired:
-            if session.is_dead:
-                logger.warning(f"Session {session_id} dead (max live exceeded)")
-                self.remove(session_id)
+        with self._lock:
+            session = self._sessions.get(session_id)
+            if not session:
                 return None
-            if self._is_pipeline_running(session.pipeline_id):
-                session.last_active_at = datetime.now()
-                self._persist_to_disk(session)
-                logger.info(f"Session {session_id} auto-renewed for running pipeline")
-                return session
-            else:
-                logger.warning(f"Session {session_id} expired (pipeline not running)")
-                self.remove(session_id)
-                return None
-        return session
+            if session.is_expired:
+                if session.is_dead:
+                    logger.warning(f"Session {session_id} dead (max live exceeded)")
+                    self.remove(session_id)
+                    return None
+                if self._is_pipeline_running(session.pipeline_id):
+                    session.last_active_at = datetime.now()
+                    self._persist_to_disk(session)
+                    logger.info(
+                        f"Session {session_id} auto-renewed for running pipeline"
+                    )
+                    return session
+                else:
+                    logger.warning(
+                        f"Session {session_id} expired (pipeline not running)"
+                    )
+                    self.remove(session_id)
+                    return None
+            return session
 
     def load_by_pipeline(self, pipeline_id: str) -> Optional[PromptPassingSession]:
-        session_id = self._pipeline_sessions.get(pipeline_id)
-        if not session_id:
-            return None
-        return self.load(session_id)
+        with self._lock:
+            session_id = self._pipeline_sessions.get(pipeline_id)
+            if not session_id:
+                return None
+            return self.load(session_id)
 
     def remove(self, session_id: str):
-        session = self._sessions.pop(session_id, None)
-        if session and session.pipeline_id:
-            self._pipeline_sessions.pop(session.pipeline_id, None)
-        if self._state_dir and session:
-            fp = Path(self._state_dir) / f"{session_id}.json"
-            if fp.exists():
-                os.unlink(fp)
+        with self._lock:
+            session = self._sessions.pop(session_id, None)
+            if session and session.pipeline_id:
+                self._pipeline_sessions.pop(session.pipeline_id, None)
+            if self._state_dir and session:
+                fp = Path(self._state_dir) / f"{session_id}.json"
+                if fp.exists():
+                    os.unlink(fp)
 
     def complete_session(self, session_id: str) -> Optional[PromptPassingSession]:
-        session = self.load(session_id)
-        if session:
-            session.completed = True
-            session.last_active_at = datetime.now()
-            self.remove(session_id)
-        return session
+        with self._lock:
+            session = self.load(session_id)
+            if session:
+                session.completed = True
+                session.last_active_at = datetime.now()
+                self.remove(session_id)
+            return session
 
     def list_active(self) -> List[PromptPassingSession]:
-        return [
-            s for s in self._sessions.values() if not s.completed and not s.is_expired
-        ]
+        with self._lock:
+            return [
+                s
+                for s in self._sessions.values()
+                if not s.completed and not s.is_expired
+            ]
 
     def cleanup_expired(self) -> int:
-        expired = [sid for sid, s in self._sessions.items() if s.is_expired]
-        for sid in expired:
-            self.remove(sid)
-        return len(expired)
+        with self._lock:
+            expired = [sid for sid, s in self._sessions.items() if s.is_expired]
+            for sid in expired:
+                self.remove(sid)
+            return len(expired)
 
     def touch(self, session_id: str):
-        session = self._sessions.get(session_id)
-        if session:
-            session.last_active_at = datetime.now()
-            self._persist_to_disk(session)
+        with self._lock:
+            session = self._sessions.get(session_id)
+            if session:
+                session.last_active_at = datetime.now()
+                self._persist_to_disk(session)
 
     def _is_pipeline_running(self, pipeline_id: str) -> bool:
         if not pipeline_id:
@@ -236,8 +253,19 @@ class SessionManager:
             return
         try:
             fp = Path(self._state_dir) / f"{session.session_id}.json"
-            with open(fp, "w", encoding="utf-8") as f:
-                json.dump(session.to_dict(), f, indent=2, ensure_ascii=False)
+            fd, tmp = tempfile.mkstemp(
+                dir=str(Path(self._state_dir)), suffix=".json.tmp"
+            )
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    json.dump(session.to_dict(), f, indent=2, ensure_ascii=False)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp, str(fp))
+            except Exception:
+                if os.path.exists(tmp):
+                    os.unlink(tmp)
+                raise
         except Exception as e:
             logger.error(f"Failed to persist session {session.session_id}: {e}")
 

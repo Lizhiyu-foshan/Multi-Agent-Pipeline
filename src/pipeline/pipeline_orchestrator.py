@@ -336,6 +336,37 @@ class PipelineOrchestrator:
         ).hexdigest()[:8]
         return f"{pipeline_id}:{phase}:{task_id}:{decision}:{result_hash}"
 
+    def _safe_phase_result_for_log(self, phase_result: Dict[str, Any]) -> str:
+        redacted_keys = {
+            "api_key",
+            "apikey",
+            "token",
+            "access_token",
+            "refresh_token",
+            "password",
+            "secret",
+            "authorization",
+            "auth",
+        }
+
+        def _redact(v):
+            if isinstance(v, dict):
+                out = {}
+                for k, x in v.items():
+                    if str(k).lower() in redacted_keys:
+                        out[k] = "***REDACTED***"
+                    else:
+                        out[k] = _redact(x)
+                return out
+            if isinstance(v, list):
+                return [_redact(x) for x in v]
+            return v
+
+        try:
+            return json.dumps(_redact(phase_result), ensure_ascii=False)[:500]
+        except Exception:
+            return str(phase_result)[:500]
+
     def advance(self, pipeline_id: str, phase_result: Dict[str, Any]) -> Dict[str, Any]:
         """
         Advance pipeline to next phase based on current phase result.
@@ -369,7 +400,7 @@ class PipelineOrchestrator:
             phase_result.get("task_id", ""),
             "orchestrator",
             phase.value,
-            f"Phase result: {json.dumps(phase_result, ensure_ascii=False)[:500]}",
+            f"Phase result: {self._safe_phase_result_for_log(phase_result)}",
         )
 
         handler = self._phase_handlers.get(phase)
@@ -830,7 +861,7 @@ class PipelineOrchestrator:
 
         if not loop_config.needs_loop:
             result = skill_adapter.execute(task_data.get("prompt", ""), context)
-            pending = result.get("pending_model_request")
+            pending = self._normalize_pending_request(result)
             if pending:
                 session = create_session_from_pending(
                     pending_request=pending,
@@ -905,8 +936,9 @@ class PipelineOrchestrator:
             loop_state = agent_loop.receive_result(loop_state, exec_result)
 
             if loop_state.needs_model:
+                pending_req = self._normalize_pending_request(exec_result)
                 session = create_session_from_pending(
-                    pending_request=exec_result.get("pending_model_request", {}),
+                    pending_request=pending_req,
                     pipeline_id=pipeline.id,
                     task_id=task_id,
                     skill_name=skill_name,
@@ -923,9 +955,7 @@ class PipelineOrchestrator:
                     "pipeline_id": pipeline.id,
                     "task_id": task_id,
                     "prompt": loop_state.prompt,
-                    "model_request_type": exec_result.get(
-                        "pending_model_request", {}
-                    ).get("type", ""),
+                    "model_request_type": pending_req.get("type", ""),
                     "model_route": loop_config.model_route.to_dict(),
                     "round": loop_state.iteration,
                     "rounds_remaining": loop_state.max_iterations
@@ -1038,6 +1068,19 @@ class PipelineOrchestrator:
             if pr.success and pr.artifacts:
                 for k, v in pr.artifacts.items():
                     self.context.store_artifact(pipeline.id, pr.task_id, k, v)
+            if pr.had_model_request:
+                # Do not mark task completed when model interaction is still pending.
+                # Keep task eligible for sequential execution path which can create
+                # session state and resume correctly.
+                self.scheduler.task_queue.update_status(
+                    pr.task_id,
+                    "pending",
+                    {
+                        "pending_model_request": pr.model_request or {},
+                        "artifacts": pr.artifacts,
+                    },
+                )
+                continue
             self.scheduler.complete_task(
                 pr.task_id,
                 pr.success,
@@ -1135,7 +1178,7 @@ class PipelineOrchestrator:
             result = skill_adapter.execute(task_data.get("prompt", ""), context)
             if result.get("pending_model_request"):
                 return {
-                    "success": True,
+                    "success": False,
                     "artifacts": result.get("artifacts", {}),
                     "pending_model_request": result["pending_model_request"],
                 }
@@ -1158,7 +1201,7 @@ class PipelineOrchestrator:
 
         if loop_state.needs_model:
             return {
-                "success": True,
+                "success": False,
                 "artifacts": first_result.get("artifacts", {}),
                 "pending_model_request": first_result.get("pending_model_request"),
             }
@@ -1568,7 +1611,7 @@ class PipelineOrchestrator:
                 "output": model_response,
             }
 
-        pending = result.get("pending_model_request")
+        pending = self._normalize_pending_request(result)
         if pending:
             new_session = create_session_from_pending(
                 pending_request=pending,
@@ -1667,8 +1710,9 @@ class PipelineOrchestrator:
             loop_state = agent_loop.receive_result(loop_state, exec_result)
 
             if loop_state.needs_model:
+                pending_req = self._normalize_pending_request(exec_result)
                 new_session = create_session_from_pending(
-                    pending_request=exec_result.get("pending_model_request", {}),
+                    pending_request=pending_req,
                     pipeline_id=pipeline.id,
                     task_id=session.task_id,
                     skill_name=session.skill_name,
@@ -1687,9 +1731,7 @@ class PipelineOrchestrator:
                     "pipeline_id": pipeline.id,
                     "task_id": session.task_id,
                     "prompt": loop_state.prompt,
-                    "model_request_type": exec_result.get(
-                        "pending_model_request", {}
-                    ).get("type", ""),
+                    "model_request_type": pending_req.get("type", ""),
                     "model_route": loop_config.model_route.to_dict(),
                     "round": new_session.round_number,
                     "rounds_remaining": new_session.rounds_remaining,
@@ -1893,6 +1935,19 @@ class PipelineOrchestrator:
         }
         return mapping.get(role_type, "superpowers")
 
+    def _normalize_pending_request(self, result: Dict[str, Any]) -> Dict[str, Any]:
+        pending = result.get("pending_model_request")
+        if isinstance(pending, dict):
+            return pending
+        if isinstance(result.get("model_request"), dict):
+            return result.get("model_request")
+        if pending:
+            return {
+                "type": "chat",
+                "prompt": str(result.get("output") or result.get("prompt") or ""),
+            }
+        return {}
+
     # ===== Utilities =====
 
     def _emit_lifecycle(self, point: str, context: Dict[str, Any]) -> Dict[str, Any]:
@@ -1914,9 +1969,14 @@ class PipelineOrchestrator:
         label: str,
         context_summary: str = "",
     ):
+        pipeline_tasks = self.scheduler.task_queue.get_by_pipeline(pipeline.id)
+        task_snapshot = {
+            "tasks": [t.to_dict() for t in pipeline_tasks],
+            "stats": self.scheduler.task_queue.get_statistics(),
+        }
         self.checkpoint_mgr.create_full_snapshot(
             pipeline,
-            self.scheduler.task_queue.get_statistics(),
+            task_snapshot,
             self.scheduler.registry.get_status(),
             context_summary=context_summary,
             label=label,
@@ -1935,8 +1995,21 @@ class PipelineOrchestrator:
                 if hooks_state:
                     hooks_file = Path(self.state_dir) / "state" / "hooks_state.json"
                     os.makedirs(hooks_file.parent, exist_ok=True)
-                    with open(hooks_file, "w", encoding="utf-8") as f:
-                        json.dump(hooks_state, f, indent=2)
+                    import tempfile
+
+                    fd, tmp = tempfile.mkstemp(
+                        dir=str(hooks_file.parent), suffix=".json.tmp"
+                    )
+                    try:
+                        with os.fdopen(fd, "w", encoding="utf-8") as f:
+                            json.dump(hooks_state, f, indent=2)
+                            f.flush()
+                            os.fsync(f.fileno())
+                        os.replace(tmp, str(hooks_file))
+                    except Exception:
+                        if os.path.exists(tmp):
+                            os.unlink(tmp)
+                        raise
             except Exception as e:
                 logger.error(f"Failed to save hooks state: {e}")
 
@@ -2208,7 +2281,17 @@ class PipelineOrchestrator:
 
     def _recover_tasks_from_snapshot(self, pipeline: PipelineRun, tasks_snapshot: Dict):
         """Restore task queue state from a checkpoint snapshot."""
-        tasks_list = tasks_snapshot.get("tasks", [])
+        if isinstance(tasks_snapshot, list):
+            tasks_list = tasks_snapshot
+        elif isinstance(tasks_snapshot, dict):
+            tasks_list = tasks_snapshot.get("tasks", [])
+        else:
+            tasks_list = []
+
+        # Backward compatibility: older checkpoints may only contain stats.
+        if not isinstance(tasks_list, list) or not tasks_list:
+            return
+
         for task_data in tasks_list:
             if not isinstance(task_data, dict):
                 continue

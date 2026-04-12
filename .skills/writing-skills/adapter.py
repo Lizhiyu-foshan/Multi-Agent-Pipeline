@@ -150,6 +150,22 @@ class WritingSkills_Adapter:
             logger.error(f"Action {action} failed: {e}")
             return {"success": False, "error": str(e)}
 
+    def _resolve_skill_dir(self, skill_name: str) -> Path:
+        if not isinstance(skill_name, str) or not skill_name.strip():
+            raise ValueError("skill_name required")
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", skill_name):
+            raise ValueError(
+                "Invalid skill_name: only letters, numbers, _ and - allowed"
+            )
+
+        skills_root = (Path(self.project_path) / ".skills").resolve()
+        candidate = (skills_root / skill_name).resolve()
+        try:
+            candidate.relative_to(skills_root)
+        except Exception as e:
+            raise ValueError("Invalid skill_name path") from e
+        return candidate
+
     def _action_scaffold(
         self, description: str, context: Dict[str, Any]
     ) -> Dict[str, Any]:
@@ -172,7 +188,10 @@ class WritingSkills_Adapter:
                 {"name": "execute", "description": "Default execution action"},
             ]
 
-        skill_dir = Path(self.project_path) / ".skills" / skill_name
+        try:
+            skill_dir = self._resolve_skill_dir(skill_name)
+        except ValueError as e:
+            return {"success": False, "error": str(e)}
         if skill_dir.exists():
             return {
                 "success": False,
@@ -216,7 +235,10 @@ class WritingSkills_Adapter:
         if not skill_name:
             return {"success": False, "error": "skill_name required"}
 
-        skill_dir = Path(self.project_path) / ".skills" / skill_name
+        try:
+            skill_dir = self._resolve_skill_dir(skill_name)
+        except ValueError as e:
+            return {"success": False, "error": str(e)}
         issues = []
         warnings = []
 
@@ -292,7 +314,10 @@ class WritingSkills_Adapter:
         if not skill_name:
             return {"success": False, "error": "skill_name required"}
 
-        skill_dir = Path(self.project_path) / ".skills" / skill_name
+        try:
+            skill_dir = self._resolve_skill_dir(skill_name)
+        except ValueError as e:
+            return {"success": False, "error": str(e)}
         if not skill_dir.exists():
             return {"success": False, "error": f"Skill not found: {skill_dir}"}
 

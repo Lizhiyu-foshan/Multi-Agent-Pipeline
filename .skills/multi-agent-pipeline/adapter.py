@@ -88,6 +88,15 @@ class MultiAgentPipeline_Adapter:
             logger.error(f"Action {action} failed: {e}")
             return {"success": False, "error": str(e)}
 
+    def _finalize_pipeline_result(
+        self, pipeline_id: str, result: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        out = dict(result or {})
+        out["pipeline_id"] = out.get("pipeline_id", pipeline_id)
+        if "success" not in out:
+            out["success"] = "error" not in out
+        return out
+
     def _action_create_pipeline(
         self, description: str, context: Dict[str, Any]
     ) -> Dict[str, Any]:
@@ -114,9 +123,7 @@ class MultiAgentPipeline_Adapter:
         phase_result = context.get("phase_result", {})
 
         result = orch.advance(pipeline_id, phase_result)
-        result["success"] = True
-        result["pipeline_id"] = pipeline_id
-        return result
+        return self._finalize_pipeline_result(pipeline_id, result)
 
     def _action_human_decision(
         self, description: str, context: Dict[str, Any]
@@ -130,9 +137,7 @@ class MultiAgentPipeline_Adapter:
             "task_id": context.get("task_id", ""),
         }
         result = orch.advance(pipeline_id, phase_result)
-        result["success"] = True
-        result["pipeline_id"] = pipeline_id
-        return result
+        return self._finalize_pipeline_result(pipeline_id, result)
 
     def _action_get_status(
         self, description: str, context: Dict[str, Any]
@@ -305,9 +310,7 @@ class MultiAgentPipeline_Adapter:
                 "results": results,
             },
         )
-
-        advance_result["success"] = True
-        return advance_result
+        return self._finalize_pipeline_result(pipeline_id, advance_result)
 
     def _action_resume_model_request(
         self, description: str, context: Dict[str, Any]

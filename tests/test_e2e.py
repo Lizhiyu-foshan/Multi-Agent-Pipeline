@@ -1760,6 +1760,15 @@ def test_writing_skills_meta():
         )
         _assert(not duplicate["success"], "Duplicate scaffold fails")
 
+        traversal = adapter.execute(
+            "",
+            {
+                "action": "scaffold",
+                "skill_name": "..\\evil-skill",
+            },
+        )
+        _assert(not traversal["success"], "Path traversal skill_name rejected")
+
         validate_result = adapter.execute(
             "",
             {
@@ -1831,7 +1840,7 @@ def test_hashline_edit_core():
 
     test_dir = _make_test_dir()
     backup_dir = os.path.join(test_dir, "backups")
-    tool = HashlineEditTool(backup_dir=backup_dir)
+    tool = HashlineEditTool(backup_dir=backup_dir, project_root=test_dir)
 
     try:
         # --- read_file on non-existent ---
@@ -2007,6 +2016,15 @@ def test_hashline_edit_core():
         _assert(status["hash_length"] == 6, "Hash length is 6")
         _assert(status["backup_dir"] == backup_dir, "Backup dir correct")
 
+        # --- Path boundary check ---
+        outside_file = str(Path(test_dir).parent / "outside_hashline.txt")
+        outside_read = tool.read_file(outside_file)
+        _assert(not outside_read["success"], "Rejects reading outside project root")
+        _assert(
+            "outside project root" in outside_read.get("error", "").lower(),
+            "Outside-path error message returned",
+        )
+
         # --- Cache management ---
         tool.clear_cache(test_file)
         status2 = tool.get_status()
@@ -2033,7 +2051,7 @@ def test_hashline_edit_integration():
         sys.path.insert(0, os.path.join(project_root, ".skills"))
         from superpowers.adapter import Superpowers_Adapter
 
-        adapter = Superpowers_Adapter(project_path=project_root)
+        adapter = Superpowers_Adapter(project_path=test_dir)
 
         # Create test file
         test_file = os.path.join(test_dir, "target.py")

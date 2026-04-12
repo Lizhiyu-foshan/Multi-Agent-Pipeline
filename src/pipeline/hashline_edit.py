@@ -130,11 +130,21 @@ class HashlineEditTool:
     is rejected before any changes are applied.
     """
 
-    def __init__(self, backup_dir: str = None):
+    def __init__(self, backup_dir: str = None, project_root: str = None):
         self._cache: Dict[str, List[AnnotatedLine]] = {}
         self._backup_dir = backup_dir
+        self._project_root = Path(project_root).resolve() if project_root else None
         if backup_dir:
             os.makedirs(backup_dir, exist_ok=True)
+
+    def _is_path_allowed(self, path: Path) -> bool:
+        if not self._project_root:
+            return True
+        try:
+            path.resolve().relative_to(self._project_root)
+            return True
+        except Exception:
+            return False
 
     def read_file(self, file_path: str) -> Dict[str, Any]:
         """
@@ -146,6 +156,13 @@ class HashlineEditTool:
         The cache is updated so subsequent edits can validate against it.
         """
         path = Path(file_path)
+        if not self._is_path_allowed(path):
+            return {
+                "success": False,
+                "error": f"Path outside project root: {file_path}",
+                "content": "",
+                "lines": [],
+            }
         if not path.exists():
             return {
                 "success": False,
@@ -286,6 +303,13 @@ class HashlineEditTool:
     def _apply_edits(self, file_path: str, ops: List[EditOp]) -> EditResult:
         path = Path(file_path).resolve()
         path_str = str(path)
+
+        if not self._is_path_allowed(path):
+            return EditResult(
+                success=False,
+                file_path=path_str,
+                error=f"Path outside project root: {path_str}",
+            )
 
         if not path.exists():
             return EditResult(
@@ -444,7 +468,12 @@ class HashlineEditTool:
 
     def restore_backup(self, backup_path: str, target_path: str) -> Dict[str, Any]:
         bp = Path(backup_path)
-        tp = Path(target_path)
+        tp = Path(target_path).resolve()
+        if not self._is_path_allowed(tp):
+            return {
+                "success": False,
+                "error": f"Path outside project root: {target_path}",
+            }
         if not bp.exists():
             return {"success": False, "error": f"Backup not found: {backup_path}"}
         try:
@@ -465,6 +494,11 @@ class HashlineEditTool:
         Returns unified diff-style output.
         """
         path = Path(file_path).resolve()
+        if not self._is_path_allowed(path):
+            return {
+                "success": False,
+                "error": f"Path outside project root: {file_path}",
+            }
         if not path.exists():
             return {"success": False, "error": "File not found"}
 
@@ -531,6 +565,7 @@ class HashlineEditTool:
             "cached_files": len(self._cache),
             "cached_file_paths": list(self._cache.keys()),
             "backup_dir": self._backup_dir or "none",
+            "project_root": str(self._project_root) if self._project_root else "none",
             "hash_length": HASH_LENGTH,
         }
 

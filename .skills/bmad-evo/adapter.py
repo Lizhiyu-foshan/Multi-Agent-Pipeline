@@ -133,20 +133,22 @@ class Bmad_Evo_Adapter:
             if ModelBridge._pending_requests:
                 latest = ModelBridge._pending_requests[-1]
                 ModelBridge._pending_requests = []
+                pending_req = {
+                    "id": latest["id"],
+                    "type": "chat",
+                    "prompt": latest["prompt"],
+                    "model": latest["model"],
+                    "instructions": (
+                        "Execute model inference for this prompt, then "
+                        "call adapter again with context.model_response "
+                        "= <your response> and context.model_request_id = "
+                        + latest["id"]
+                    ),
+                }
                 return {
                     "success": False,
-                    "pending_model_request": True,
-                    "model_request": {
-                        "id": latest["id"],
-                        "prompt": latest["prompt"],
-                        "model": latest["model"],
-                        "instructions": (
-                            "Execute model inference for this prompt, then "
-                            "call adapter again with context.model_response "
-                            "= <your response> and context.model_request_id = "
-                            + latest["id"]
-                        ),
-                    },
+                    "pending_model_request": pending_req,
+                    "model_request": pending_req,
                 }
 
             enriched = self._enrich_with_spec(analysis.to_dict(), spec_context)
@@ -167,20 +169,22 @@ class Bmad_Evo_Adapter:
             }
         except Exception as e:
             if ModelRequestPending and isinstance(e, ModelRequestPending):
+                pending_req = {
+                    "id": e.request_id,
+                    "type": "chat",
+                    "prompt": e.prompt,
+                    "model": e.model,
+                    "instructions": (
+                        "Execute model inference for this prompt, then "
+                        "call adapter again with context.model_response "
+                        "= <your response> and context.model_request_id = "
+                        + e.request_id
+                    ),
+                }
                 return {
                     "success": False,
-                    "pending_model_request": True,
-                    "model_request": {
-                        "id": e.request_id,
-                        "prompt": e.prompt,
-                        "model": e.model,
-                        "instructions": (
-                            "Execute model inference for this prompt, then "
-                            "call adapter again with context.model_response "
-                            "= <your response> and context.model_request_id = "
-                            + e.request_id
-                        ),
-                    },
+                    "pending_model_request": pending_req,
+                    "model_request": pending_req,
                 }
             logger.warning(f"BMAD analysis failed, using fallback: {e}")
             return self._fallback_analysis(task_description, spec_context)
