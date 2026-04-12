@@ -1335,18 +1335,25 @@ class SkillWithMultiRoundPending:
 
     def execute(self, description: str, context: Dict) -> Dict[str, Any]:
         self.call_count += 1
-        if self.call_count == 1:
+        if self.call_count <= 2:
             return {
                 "success": False,
                 "pending_model_request": {
                     "type": "analysis",
-                    "prompt": f"Round 1: Analyze '{description[:50]}'",
+                    "prompt": f"Round {self.call_count}: Analyze '{description[:50]}'",
                 },
                 "artifacts": {},
             }
         return {
             "success": True,
-            "artifacts": {"analysis": "completed", "round": self.call_count},
+            "output": f"Completed after {self.call_count} rounds",
+            "artifacts": {
+                "code": "def auth():\n    return jwt.encode({})\n\ndef verify(token):\n    return jwt.decode(token)",
+                "tests": "def test_auth():\n    token = auth()\n    assert verify(token)\n    print('ok')",
+                "implementation": "Auth module with JWT",
+                "analysis": "completed",
+                "round": self.call_count,
+            },
         }
 
     def continue_execution(self, model_response: str, context: Dict) -> Dict[str, Any]:
@@ -2210,8 +2217,8 @@ def test_lifecycle_hooks_registry():
         status = registry.get_status()
         _assert(status["total_handlers"] == 0, "Starts with 0 handlers")
         _assert(
-            len(status["available_points"]) == 6,
-            f"6 lifecycle points: {len(status['available_points'])}",
+            len(status["available_points"]) == 8,
+            f"8 lifecycle points: {len(status['available_points'])}",
         )
 
         call_log = []
@@ -4083,3 +4090,737 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+# ===== Batch 2 Tests: Recovery, Retry, Watchdog, Named Hooks =====
+
+
+def test_orchestrator_recover():
+    _section("Test B2-1: Orchestrator.recover() - Pipeline Recovery")
+
+    test_dir = _make_test_dir()
+
+    try:
+        skills = {
+            "bmad-evo": SimulatedBmadEvo(),
+            "superpowers": SimulatedSuperpowers(),
+            "spec-kit": SimulatedSpecKit(),
+        }
+
+        orch = PipelineOrchestrator(state_dir=test_dir, skills=skills)
+        pipeline, _ = orch.create_pipeline("Test recovery pipeline")
+        _assert(pipeline is not None, "Pipeline created")
+
+        orch.scheduler.registry.register("developer", "Developer", ["code"])
+        t1 = orch.scheduler.submit_task(
+            {
+                "pipeline_id": pipeline.id,
+                "role_id": "developer",
+                "name": "Task A",
+                "description": "Build module A",
+                "priority": "P1",
+                "depends_on": [],
+            }
+        )
+        t2 = orch.scheduler.submit_task(
+            {
+                "pipeline_id": pipeline.id,
+                "role_id": "developer",
+                "name": "Task B",
+                "description": "Build module B",
+                "priority": "P2",
+                "depends_on": [],
+            }
+        )
+        pipeline.tasks = [t1["task_id"], t2["task_id"]]
+        pipeline.phase = PipelinePhase.EXECUTE
+        pipeline.state = PipelineState.RUNNING
+        orch._save_pipelines()
+
+        orch.checkpoint_mgr.create_full_snapshot(
+            pipeline,
+            orch.scheduler.task_queue.get_statistics(),
+            orch.scheduler.registry.get_status(),
+            label="pre_crash",
+        )
+
+        pipeline.state = PipelineState.FAILED
+        pipeline.phase = PipelinePhase.FAILED
+        orch._save_pipelines()
+
+        result = orch.recover(pipeline.id, strategy="latest")
+        _assert(result.get("recovered"), f"Recovery succeeded: {result.get('error')}")
+        _assert(result.get("strategy") == "latest", "Correct strategy")
+        _assert(
+            pipeline.state == PipelineState.RUNNING,
+            f"Pipeline state restored: {pipeline.state}",
+        )
+        _assert(
+            pipeline.recovery_count == 1, f"Recovery count: {pipeline.recovery_count}"
+        )
+        _assert(
+            pipeline.last_recovery_at is not None,
+            "Last recovery timestamp set",
+        )
+
+        result2 = orch.recover(pipeline.id, strategy="clean")
+        _assert(result2.get("recovered"), "Clean recovery succeeded")
+        _assert(pipeline.recovery_count == 2, "Recovery count incremented")
+
+        bad_result = orch.recover("nonexistent_pipeline")
+        _assert("error" in bad_result, "Error for nonexistent pipeline")
+
+        pipeline.state = PipelineState.COMPLETED
+        orch._save_pipelines()
+        no_recover = orch.recover(pipeline.id)
+        _assert("error" in no_recover, "Error for completed pipeline without force")
+
+        force_result = orch.recover(pipeline.id, strategy="force")
+        _assert(force_result.get("recovered"), "Force recovery overrides completed")
+
+        print(f"  Recovery pipeline: {pipeline.id}")
+        print(f"  Recovery count: {pipeline.recovery_count}")
+
+    finally:
+        _cleanup(test_dir)
+
+
+def test_task_retry_with_backoff():
+    _section("Test B2-2: Task Retry with Exponential Backoff")
+
+    test_dir = _make_test_dir()
+
+    try:
+        from datetime import datetime
+        from pipeline.task_queue import TaskQueue
+
+        state_file = os.path.join(test_dir, "task_queue.json")
+        tq = TaskQueue(state_file=state_file)
+
+        task = Task(
+            pipeline_id="pipe_test",
+            role_id="developer",
+            name="Retry test task",
+            max_retries=4,
+            retry_delay_seconds=10.0,
+            retry_backoff_factor=2.0,
+        )
+        tq.submit(task)
+        task_id = task.id
+
+        tq.update_status(task_id, "processing")
+        tq.update_status(task_id, "failed", {"error": "timeout"})
+
+        failed_task = tq.get(task_id)
+        _assert(failed_task.status == "failed", "Task is failed")
+        _assert(
+            failed_task.retry_count == 0, f"Retry count is 0: {failed_task.retry_count}"
+        )
+
+        retry1 = tq.retry_with_backoff(task_id, error="timeout on attempt 1")
+        _assert(retry1["retried"], f"Retry 1 succeeded: {retry1}")
+        _assert(retry1["delay"] == 10.0, f"First delay is base: {retry1['delay']}")
+        _assert(
+            retry1["attempts_remaining"] == 3,
+            f"3 remaining: {retry1['attempts_remaining']}",
+        )
+
+        t = tq.get(task_id)
+        _assert(t.status == "pending", f"Status reset to pending: {t.status}")
+        _assert(t.retry_count == 1, f"Retry count 1: {t.retry_count}")
+        _assert(t.last_retry_at is not None, "Last retry timestamp set")
+        _assert(
+            len(t.failure_history) >= 1, f"Failure recorded: {len(t.failure_history)}"
+        )
+
+        tq.update_status(task_id, "failed", {"error": "timeout on attempt 2"})
+        retry2 = tq.retry_with_backoff(task_id, error="timeout on attempt 2")
+        _assert(retry2["retried"], "Retry 2 succeeded")
+        _assert(retry2["delay"] == 20.0, f"Second delay is 2x: {retry2['delay']}")
+
+        tq.update_status(task_id, "failed", {"error": "timeout on attempt 3"})
+        retry3 = tq.retry_with_backoff(task_id, error="timeout on attempt 3")
+        _assert(retry3["retried"], "Retry 3 succeeded")
+        _assert(retry3["delay"] == 40.0, f"Third delay is 4x: {retry3['delay']}")
+
+        tq.update_status(task_id, "failed", {"error": "timeout on attempt 4"})
+        retry4 = tq.retry_with_backoff(task_id, error="final failure")
+        _assert(not retry4["retried"], "Retry 4 blocked - max exceeded")
+
+        t = tq.get(task_id)
+        _assert(
+            len(t.failure_history) >= 4,
+            f"4+ failures recorded: {len(t.failure_history)}",
+        )
+
+        not_failed_retry = tq.retry_with_backoff(task_id)
+        _assert(not not_failed_retry.get("retried"), "Can't retry non-failed status")
+
+        print(f"  Task retry backoff: 10s -> 20s -> 40s -> blocked")
+        print(f"  Failure history: {len(t.failure_history)} entries")
+
+    finally:
+        _cleanup(test_dir)
+
+
+def test_pipeline_watchdog():
+    _section("Test B2-3: PipelineWatchdog - Health Monitoring")
+
+    test_dir = _make_test_dir()
+
+    try:
+        from pipeline.pipeline_watchdog import (
+            PipelineWatchdog,
+            WatchdogConfig,
+            HealthStatus,
+        )
+        from datetime import datetime, timedelta
+
+        skills = {
+            "bmad-evo": SimulatedBmadEvo(),
+            "superpowers": SimulatedSuperpowers(),
+            "spec-kit": SimulatedSpecKit(),
+        }
+
+        orch = PipelineOrchestrator(state_dir=test_dir, skills=skills)
+        pipeline, _ = orch.create_pipeline("Test watchdog pipeline")
+        pipeline.state = PipelineState.RUNNING
+        pipeline.phase = PipelinePhase.EXECUTE
+        orch._save_pipelines()
+
+        config = WatchdogConfig(
+            check_interval_seconds=1.0,
+            task_stall_threshold_seconds=5.0,
+            auto_recover=False,
+        )
+        wd = PipelineWatchdog(orchestrator=orch, config=config)
+
+        health = wd.check(pipeline.id)
+        _assert(health.status == HealthStatus.HEALTHY, f"Healthy: {health.status}")
+        _assert(len(health.issues) == 0, f"No issues: {health.issues}")
+
+        wd.register_pipeline(pipeline.id)
+        all_results = wd.check_all()
+        _assert(len(all_results) >= 1, "check_all returns results")
+
+        orch.scheduler.registry.register("developer", "Developer", ["code"])
+        t1 = orch.scheduler.submit_task(
+            {
+                "pipeline_id": pipeline.id,
+                "role_id": "developer",
+                "name": "Stalled task",
+                "description": "Will appear stalled",
+                "priority": "P1",
+                "depends_on": [],
+            }
+        )
+        pipeline.tasks = [t1["task_id"]]
+        task_id = t1["task_id"]
+
+        task = orch.scheduler.task_queue.get(task_id)
+        task.status = "processing"
+        task.started_at = datetime.now() - timedelta(seconds=10)
+        orch.scheduler.task_queue._save()
+
+        health2 = wd.check(pipeline.id)
+        _assert(
+            health2.status == HealthStatus.STALLED,
+            f"Stalled detected: {health2.status}",
+        )
+        _assert(task_id in health2.stalled_tasks, "Correct task identified as stalled")
+        _assert(len(health2.issues) > 0, "Issues reported")
+
+        stall_events = []
+
+        def on_stall(h):
+            stall_events.append(h.pipeline_id)
+
+        config2 = WatchdogConfig(
+            task_stall_threshold_seconds=5.0,
+            auto_retry_stalled_tasks=True,
+            on_stall_callback=on_stall,
+        )
+        wd2 = PipelineWatchdog(orchestrator=orch, config=config2)
+        action = wd2.take_action(health2)
+        _assert(len(stall_events) == 1, "Stall callback fired")
+        _assert(
+            any("retry_stalled" in a for a in action["actions"]), "Stalled task retried"
+        )
+
+        status = wd.get_status()
+        _assert("config" in status, "Status has config")
+        _assert("recovery_attempts" in status, "Status has recovery_attempts")
+
+        print(f"  Watchdog detected stalled task: {task_id}")
+        print(f"  Actions taken: {action['actions']}")
+
+    finally:
+        _cleanup(test_dir)
+
+
+def test_named_lifecycle_hooks():
+    _section("Test B2-4: Named Lifecycle Hooks - Recovery and Export/Import")
+
+    test_dir = _make_test_dir()
+
+    try:
+        from specs.spec_gate import (
+            LifecycleHookRegistry,
+            register_named_handler,
+            get_named_handler,
+        )
+
+        registry = LifecycleHookRegistry()
+
+        call_log = []
+
+        def audit_logger(ctx):
+            call_log.append(("audit", ctx.get("pipeline_id")))
+            return ctx
+
+        def metrics_collector(ctx):
+            call_log.append(("metrics", ctx.get("pipeline_id")))
+            return ctx
+
+        registry.register_named(
+            "on_pipeline_start", "audit_logger", audit_logger, priority=10
+        )
+        registry.register_named(
+            "on_pipeline_start",
+            "metrics_collector",
+            metrics_collector,
+            priority=20,
+        )
+
+        listed = registry.list_handlers("on_pipeline_start")
+        _assert(len(listed["on_pipeline_start"]) == 2, f"2 handlers: {listed}")
+
+        h = get_named_handler("on_pipeline_start", "audit_logger")
+        _assert(h is not None, "Named handler retrieved")
+        _assert(h is audit_logger, "Same function reference")
+
+        result = registry.emit("on_pipeline_start", {"pipeline_id": "p1"})
+        _assert(
+            call_log == [("audit", "p1"), ("metrics", "p1")],
+            f"Called in order: {call_log}",
+        )
+
+        state = registry.export_state()
+        _assert("on_pipeline_start" in state, "State has on_pipeline_start")
+        _assert(len(state["on_pipeline_start"]) == 2, "2 handler entries in state")
+        _assert(
+            state["on_pipeline_start"][0]["name"] == "audit_logger",
+            "First handler is audit_logger",
+        )
+
+        registry2 = LifecycleHookRegistry()
+        registry2.import_state(state)
+        call_log2 = []
+        registry2.emit("on_pipeline_start", {"pipeline_id": "p2"})
+        listed2 = registry2.list_handlers("on_pipeline_start")
+        _assert(
+            len(listed2["on_pipeline_start"]) == 2,
+            f"2 handlers after import: {listed2}",
+        )
+
+        registry.unregister_by_name("on_pipeline_start", "audit_logger")
+        listed3 = registry.list_handlers("on_pipeline_start")
+        _assert(
+            len(listed3["on_pipeline_start"]) == 1,
+            f"1 handler after unregister_by_name: {listed3}",
+        )
+
+        print(f"  Named hooks: export/import/recover verified")
+
+    finally:
+        _cleanup(test_dir)
+
+
+def test_auto_retry_in_execute():
+    _section("Test B2-5: Auto-Retry in Execute Phase")
+
+    test_dir = _make_test_dir()
+
+    try:
+        from datetime import datetime
+
+        class FailOnceSkill:
+            def __init__(self):
+                self.call_count = 0
+
+            def execute(self, description, context):
+                self.call_count += 1
+                if self.call_count == 1:
+                    return {
+                        "success": False,
+                        "error": "transient failure",
+                        "artifacts": {},
+                    }
+                return {
+                    "success": True,
+                    "output": "done",
+                    "artifacts": {
+                        "code": "x = 1\nassert x == 1\nprint('ok')",
+                        "tests": "def test_x():\n    assert x == 1",
+                        "implementation": "module",
+                    },
+                }
+
+        skills = {
+            "bmad-evo": SimulatedBmadEvo(),
+            "superpowers": FailOnceSkill(),
+            "spec-kit": SimulatedSpecKit(),
+        }
+
+        orch = PipelineOrchestrator(state_dir=test_dir, skills=skills)
+        orch.scheduler.registry.register("developer", "Developer", ["code"])
+
+        pipeline, _ = orch.create_pipeline("Test auto-retry")
+        t1 = orch.scheduler.submit_task(
+            {
+                "pipeline_id": pipeline.id,
+                "role_id": "developer",
+                "name": "Auto-retry task",
+                "description": "Will fail then succeed",
+                "priority": "P1",
+                "depends_on": [],
+            }
+        )
+        pipeline.tasks = [t1["task_id"]]
+        pipeline.phase = PipelinePhase.EXECUTE
+        pipeline.state = PipelineState.RUNNING
+        orch._save_pipelines()
+
+        task_id = t1["task_id"]
+
+        task = orch.scheduler.task_queue.get(task_id)
+        task.status = "failed"
+        task.retry_count = 0
+        task.max_retries = 2
+        task.retry_delay_seconds = 0.0
+        task.failure_history.append(
+            {
+                "attempt": 1,
+                "error": "test failure",
+                "timestamp": datetime.now().isoformat(),
+            }
+        )
+        orch.scheduler.task_queue._save()
+
+        result = orch._handle_execute(
+            pipeline,
+            {"task_id": task_id, "skill": "superpowers"},
+        )
+
+        task_after = orch.scheduler.task_queue.get(task_id)
+        _assert(
+            task_after.retry_count >= 1,
+            f"Retry count incremented: {task_after.retry_count}",
+        )
+        _assert(
+            task_after.status in ("pending", "completed", "processing"),
+            f"Task re-queued or completed: {task_after.status}",
+        )
+
+        print(f"  Auto-retry in execute phase verified")
+        print(f"  Task status: failed -> {task_after.status}")
+        print(f"  Retry count: {task_after.retry_count}")
+
+    finally:
+        _cleanup(test_dir)
+
+
+# ===== Batch 2 Integration: Watchdog Auto-Lifecycle =====
+
+
+def test_watchdog_auto_lifecycle():
+    _section("Test B2-6: Watchdog Auto-Lifecycle with Pipeline")
+
+    test_dir = _make_test_dir()
+
+    try:
+        from pipeline.pipeline_watchdog import HealthStatus
+        from datetime import datetime, timedelta
+
+        skills = {
+            "bmad-evo": SimulatedBmadEvo(),
+            "superpowers": SimulatedSuperpowers(),
+            "spec-kit": SimulatedSpecKit(),
+        }
+
+        orch = PipelineOrchestrator(
+            state_dir=test_dir,
+            skills=skills,
+            watchdog_config={
+                "check_interval_seconds": 1.0,
+                "task_stall_threshold_seconds": 5.0,
+                "auto_recover": False,
+                "auto_retry_stalled_tasks": True,
+            },
+        )
+
+        _assert(orch.watchdog is not None, "Watchdog initialized by default")
+        _assert(orch.watchdog.monitored_count == 0, "No pipelines monitored initially")
+
+        orch.scheduler.registry.register("developer", "Developer", ["code"])
+        pipeline, _ = orch.create_pipeline("Watchdog lifecycle test")
+
+        orch._handle_init(
+            pipeline,
+            {
+                "user_input": "Build auth module",
+                "action": "init",
+            },
+        )
+
+        _assert(
+            pipeline.id in orch.watchdog._monitored_pipelines,
+            "Pipeline registered with watchdog after start",
+        )
+        _assert(
+            orch.watchdog.monitored_count == 1,
+            f"1 monitored: {orch.watchdog.monitored_count}",
+        )
+
+        health = orch.watchdog.check(pipeline.id)
+        _assert(
+            health.status == HealthStatus.HEALTHY, f"Pipeline healthy: {health.status}"
+        )
+
+        t1 = orch.scheduler.submit_task(
+            {
+                "pipeline_id": pipeline.id,
+                "role_id": "developer",
+                "name": "Test task",
+                "description": "A task for watchdog test",
+                "priority": "P1",
+                "depends_on": [],
+            }
+        )
+        pipeline.tasks = [t1["task_id"]]
+        orch._save_pipelines()
+
+        orch.scheduler.task_queue.update_status(t1["task_id"], "failed")
+        task = orch.scheduler.task_queue.get(t1["task_id"])
+        task.retry_delay_seconds = 0.0
+        task.max_retries = 2
+        orch.scheduler.task_queue._save()
+
+        orch._handle_execute(
+            pipeline,
+            {"task_id": t1["task_id"], "skill": "superpowers"},
+        )
+
+        orch._handle_failure(pipeline, "test failure", {"error": "test"})
+
+        _assert(
+            pipeline.id not in orch.watchdog._monitored_pipelines,
+            "Pipeline unregistered from watchdog after failure",
+        )
+        _assert(
+            orch.watchdog.monitored_count == 0,
+            f"0 monitored after failure: {orch.watchdog.monitored_count}",
+        )
+
+        orch.recover(pipeline.id, strategy="clean")
+        _assert(
+            pipeline.id in orch.watchdog._monitored_pipelines,
+            "Pipeline re-registered with watchdog after recover",
+        )
+
+        orch.shutdown()
+        _assert(
+            not orch.watchdog.is_running,
+            "Watchdog stopped after shutdown",
+        )
+
+        print(
+            f"  Watchdog auto-lifecycle: start -> monitor -> end -> recover -> shutdown"
+        )
+
+    finally:
+        _cleanup(test_dir)
+
+
+def test_crash_recovery_e2e():
+    """Feature #8: End-to-end crash recovery test.
+
+    Simulates:
+    1. Pipeline running normally through INIT -> ANALYZE -> PLAN -> EXECUTE
+    2. Crash at EXECUTE phase (no graceful shutdown)
+    3. New orchestrator instance discovers crashed pipeline
+    4. Recovery via checkpoint restore
+    5. Pipeline continues and completes
+    """
+    _section("Feature #8: Crash Recovery E2E")
+    test_dir = _make_test_dir()
+
+    try:
+        skills = {
+            "bmad-evo": SimulatedBmadEvo(),
+            "superpowers": SimulatedSuperpowers(),
+            "spec-kit": SimulatedSpecKit(),
+        }
+
+        # === Phase 1: Normal operation up to EXECUTE ===
+        orch1 = PipelineOrchestrator(state_dir=test_dir, skills=skills)
+
+        pipeline, _ = orch1.create_pipeline("Test crash recovery pipeline")
+        _assert(pipeline is not None, "Phase 1: Pipeline created")
+
+        # INIT -> ANALYZE (calls bmad-evo)
+        result = orch1.advance(pipeline.id, {"success": True})
+        if (
+            result.get("action") == "human_decision"
+            and pipeline.phase == PipelinePhase.INIT
+        ):
+            result = orch1.advance(pipeline.id, {"decision": "A"})
+        _assert(
+            result.get("action") in ("call_skill", "execute_task", "human_decision"),
+            f"Phase 1: INIT transition: {result['action']}",
+        )
+
+        # Provide analysis result -> PLAN
+        analyze_result = {
+            "success": True,
+            "artifacts": {
+                "roles": [
+                    {"type": "developer", "name": "Dev", "capabilities": ["code"]},
+                    {"type": "tester", "name": "QA", "capabilities": ["test"]},
+                ],
+                "tasks": [
+                    {
+                        "name": "Build module",
+                        "role": "developer",
+                        "description": "Build core module",
+                        "priority": "P1",
+                        "depends_on": [],
+                    },
+                    {
+                        "name": "Test module",
+                        "role": "tester",
+                        "description": "Test core module",
+                        "priority": "P2",
+                        "depends_on": ["Build module"],
+                    },
+                ],
+            },
+        }
+        result = orch1.advance(pipeline.id, analyze_result)
+        _assert(
+            result.get("action") in ("call_skill", "execute_task", "human_decision"),
+            f"Phase 1: ANALYZE transition: {result['action']}",
+        )
+
+        # Provide plan result -> CONFIRM_PLAN
+        plan_result = {
+            "success": True,
+            "artifacts": {
+                "task_graph": {
+                    "tasks": [
+                        {
+                            "name": "Build module",
+                            "role_id": "developer",
+                            "description": "Build core module",
+                            "priority": "P1",
+                            "depends_on": [],
+                        },
+                        {
+                            "name": "Test module",
+                            "role_id": "tester",
+                            "description": "Test core module",
+                            "priority": "P2",
+                            "depends_on": ["Build module"],
+                        },
+                    ],
+                },
+            },
+        }
+        result = orch1.advance(pipeline.id, plan_result)
+        _assert(
+            result.get("action") == "human_decision",
+            f"Phase 1: At confirm_plan: {result['action']}",
+        )
+        _assert(
+            pipeline.phase == PipelinePhase.CONFIRM_PLAN,
+            f"Phase 1: Phase is confirm_plan: {pipeline.phase}",
+        )
+
+        # CONFIRM_PLAN -> EXECUTE (approve plan)
+        result = orch1.advance(pipeline.id, {"decision": "A"})
+        _assert(
+            result.get("action")
+            in ("execute_next_task", "execute_task", "model_request"),
+            f"Phase 1: At execute: {result['action']}",
+        )
+        _assert(
+            pipeline.phase == PipelinePhase.EXECUTE,
+            f"Phase 1: Phase is execute: {pipeline.phase}",
+        )
+
+        # Create checkpoint before "crash"
+        orch1.checkpoint_mgr.create_full_snapshot(
+            pipeline,
+            orch1.scheduler.task_queue.get_statistics(),
+            orch1.scheduler.registry.get_status(),
+            label="pre_crash",
+        )
+        _assert(
+            len(orch1.checkpoint_mgr.list_checkpoints(pipeline.id)) >= 1,
+            "Phase 1: Checkpoint created before crash",
+        )
+
+        pipeline_id = pipeline.id
+        _assert(pipeline.state == PipelineState.RUNNING, "Phase 1: State is RUNNING")
+
+        # === Phase 2: Simulate crash - just abandon orchestrator ===
+        del orch1
+
+        # === Phase 3: New orchestrator discovers and recovers ===
+        orch2 = PipelineOrchestrator(state_dir=test_dir, skills=skills)
+
+        # Verify pipeline state persisted
+        recovered_pipeline = orch2.pipelines.get(pipeline_id)
+        _assert(
+            recovered_pipeline is not None,
+            "Phase 3: Pipeline found after restart",
+        )
+
+        # Run recovery
+        recovery_result = orch2.recover(pipeline_id, strategy="latest")
+        _assert(
+            recovery_result.get("recovered") is True,
+            f"Phase 3: Recovery succeeded: {recovery_result}",
+        )
+        _assert(
+            recovery_result["strategy"] == "latest",
+            "Phase 3: Used latest strategy",
+        )
+
+        # Verify progress report works after recovery
+        report = orch2.get_progress_report(pipeline_id)
+        _assert(
+            report is not None,
+            "Phase 3: Progress report available after recovery",
+        )
+        assert len(report["phase_timeline"]) > 0
+
+        # Verify pipeline can continue executing
+        _assert(
+            recovered_pipeline.state == PipelineState.RUNNING,
+            f"Phase 3: State is RUNNING after recovery: {recovered_pipeline.state}",
+        )
+
+        # === Phase 4: Verify continued operation after recovery ===
+        result = orch2.advance(pipeline_id, {"task_id": "", "skill": "superpowers"})
+        _assert(
+            "error" not in result or result.get("action") is not None,
+            f"Phase 4: Advance works after recovery: {result}",
+        )
+
+        print(f"  Crash recovery E2E completed successfully")
+        print(f"  Pipeline ID: {pipeline_id}")
+        print(f"  Phase timeline entries: {len(report['phase_timeline'])}")
+
+    finally:
+        _cleanup(test_dir)

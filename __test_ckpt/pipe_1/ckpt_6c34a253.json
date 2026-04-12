@@ -1,0 +1,39 @@
+{
+  "id": "ckpt_6c34a253",
+  "pipeline_id": "pipe_1",
+  "phase": "init",
+  "task_id": null,
+  "snapshot": {
+    "pipeline": {
+      "id": "pipe_1",
+      "description": "test",
+      "state": "running",
+      "phase": "init",
+      "tasks": [],
+      "roles": [],
+      "artifacts": {},
+      "decision_history": [],
+      "pdca_cycle": 0,
+      "created_at": "2026-04-12T13:27:58.222426",
+      "updated_at": "2026-04-12T13:27:58.222470",
+      "completed_at": null,
+      "max_duration_hours": 5.0,
+      "started_at": null,
+      "recovery_count": 0,
+      "last_recovery_at": null,
+      "last_checkpoint_id": "",
+      "decision_timeout_seconds": 1800.0,
+      "last_decision_at": null
+    },
+    "tasks": {
+      "pending": 1
+    },
+    "roles": {
+      "roles": []
+    },
+    "context_summary": "",
+    "timestamp": "2026-04-12T13:27:58.222521"
+  },
+  "created_at": "2026-04-12T13:27:58.222607",
+  "label": "base"
+}

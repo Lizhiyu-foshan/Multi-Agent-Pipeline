@@ -29,6 +29,7 @@ class CheckpointManager:
             state_dir = Path(state_dir)
         self.state_dir = state_dir
         self.state_dir.mkdir(parents=True, exist_ok=True)
+        self._last_snapshot: Dict[str, Dict[str, Any]] = {}
 
     def create_checkpoint(
         self,
@@ -60,19 +61,109 @@ class CheckpointManager:
         context_summary: str = "",
         label: str = "",
     ) -> Checkpoint:
-        snapshot = {
+        current = {
             "pipeline": pipeline_run.to_dict(),
             "tasks": task_queue_snapshot,
             "roles": roles_snapshot,
             "context_summary": context_summary,
             "timestamp": datetime.now().isoformat(),
         }
+        last = self._last_snapshot.get(pipeline_run.id)
+        if last:
+            delta = self._compute_delta(last, current)
+            if delta.get("is_delta"):
+                ckpt = self.create_checkpoint(
+                    pipeline_id=pipeline_run.id,
+                    phase=pipeline_run.phase,
+                    label=label or f"pdca_cycle_{pipeline_run.pdca_cycle}",
+                    snapshot=delta,
+                )
+                self._last_snapshot[pipeline_run.id] = current
+                return ckpt
+
+        self._last_snapshot[pipeline_run.id] = current
         return self.create_checkpoint(
             pipeline_id=pipeline_run.id,
             phase=pipeline_run.phase,
             label=label or f"pdca_cycle_{pipeline_run.pdca_cycle}",
-            snapshot=snapshot,
+            snapshot=current,
         )
+
+    def _compute_delta(
+        self, previous: Dict[str, Any], current: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Compute delta between previous and current snapshot."""
+        delta: Dict[str, Any] = {"is_delta": True}
+        has_changes = False
+
+        prev_pipe = previous.get("pipeline", {})
+        curr_pipe = current.get("pipeline", {})
+
+        pipe_diff = {}
+        for key in (
+            "phase",
+            "state",
+            "pdca_cycle",
+            "tasks",
+            "roles",
+            "artifacts",
+            "decision_history",
+            "recovery_count",
+            "last_checkpoint_id",
+        ):
+            if curr_pipe.get(key) != prev_pipe.get(key):
+                pipe_diff[key] = curr_pipe.get(key)
+                has_changes = True
+
+        if pipe_diff:
+            pipe_diff["id"] = curr_pipe.get("id", "")
+            delta["pipeline_delta"] = pipe_diff
+        else:
+            delta["pipeline_delta"] = None
+
+        prev_tasks = previous.get("tasks", {})
+        curr_tasks = current.get("tasks", {})
+        if curr_tasks != prev_tasks:
+            delta["tasks"] = curr_tasks
+            has_changes = True
+        else:
+            delta["tasks"] = None
+
+        delta["roles"] = (
+            current.get("roles")
+            if current.get("roles") != previous.get("roles")
+            else None
+        )
+        delta["context_summary"] = current.get("context_summary", "")
+        delta["timestamp"] = current.get("timestamp", "")
+        delta["base_checkpoint_id"] = previous.get("pipeline", {}).get("id", "")
+
+        if not has_changes:
+            return {"is_delta": False}
+
+        return delta
+
+    def _apply_delta(
+        self, base: Dict[str, Any], delta: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Apply a delta to a base snapshot to reconstruct full state."""
+        if not delta.get("is_delta"):
+            return delta
+
+        result = dict(base)
+        pipe_delta = delta.get("pipeline_delta")
+        if pipe_delta:
+            pipeline = dict(result.get("pipeline", {}))
+            pipeline.update(pipe_delta)
+            result["pipeline"] = pipeline
+
+        if delta.get("tasks") is not None:
+            result["tasks"] = delta["tasks"]
+        if delta.get("roles") is not None:
+            result["roles"] = delta["roles"]
+        result["context_summary"] = delta.get("context_summary", "")
+        result["timestamp"] = delta.get("timestamp", "")
+        return result
 
     def restore_latest(self, pipeline_id: str) -> Optional[Dict[str, Any]]:
         checkpoints = self.list_checkpoints(pipeline_id)
@@ -80,7 +171,38 @@ class CheckpointManager:
             logger.warning(f"No checkpoints found for {pipeline_id}")
             return None
         latest = checkpoints[-1]
-        return self._load_checkpoint(latest["id"])
+        data = self._load_checkpoint(latest["id"])
+        if data and data.get("snapshot", {}).get("is_delta"):
+            data["snapshot"] = self._reconstruct_from_delta(pipeline_id, checkpoints)
+        return data
+
+    def _reconstruct_from_delta(
+        self, pipeline_id: str, checkpoints: List[Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        """Walk backwards from latest to find full base, then apply deltas forward."""
+        all_snaps = []
+        for ckpt_meta in reversed(checkpoints):
+            data = self._load_checkpoint(ckpt_meta["id"])
+            if data:
+                all_snaps.append(data.get("snapshot", {}))
+
+        if not all_snaps:
+            return {}
+
+        base_idx = None
+        for i, snap in enumerate(all_snaps):
+            if not snap.get("is_delta"):
+                base_idx = i
+                break
+
+        if base_idx is None:
+            return all_snaps[0] if all_snaps else {}
+
+        result = all_snaps[base_idx]
+        for i in range(base_idx - 1, -1, -1):
+            result = self._apply_delta(result, all_snaps[i])
+
+        return result
 
     def restore_to_phase(
         self, pipeline_id: str, phase: str
@@ -107,7 +229,7 @@ class CheckpointManager:
         if not ckpt_dir.exists():
             return []
         results = []
-        for f in sorted(ckpt_dir.glob("*.json")):
+        for f in ckpt_dir.glob("*.json"):
             try:
                 with open(f, "r", encoding="utf-8") as fh:
                     data = json.load(fh)
@@ -122,6 +244,7 @@ class CheckpointManager:
                 )
             except Exception:
                 continue
+        results.sort(key=lambda x: x.get("created_at", ""))
         return results
 
     def cleanup_old(self, pipeline_id: str, keep: int = 10):

@@ -64,7 +64,29 @@ LIFECYCLE_POINTS = (
     "on_pdca_cycle",
     "on_pipeline_complete",
     "on_error",
+    "on_recover",
+    "on_retry",
 )
+
+_NAMED_HANDLERS: Dict[str, Dict[str, Callable]] = defaultdict(dict)
+
+
+def register_named_handler(
+    point: str, name: str, handler: Callable, priority: int = 50
+):
+    """Register a named handler that can be recovered by name after restart."""
+    if point not in LIFECYCLE_POINTS:
+        raise ValueError(
+            f"Unknown lifecycle point: {point}. Available: {list(LIFECYCLE_POINTS)}"
+        )
+    handler._hook_name = name
+    handler._hook_priority = priority
+    _NAMED_HANDLERS[point][name] = handler
+
+
+def get_named_handler(point: str, name: str) -> Optional[Callable]:
+    """Retrieve a previously registered named handler."""
+    return _NAMED_HANDLERS.get(point, {}).get(name)
 
 
 class LifecycleHookRegistry:
@@ -75,6 +97,11 @@ class LifecycleHookRegistry:
     Handlers execute in registration order; each receives the accumulated
     context dict and returns an enriched/modified context dict.
     A handler can set context["_abort"] = True to stop the chain.
+
+    Supports named handlers for crash recovery:
+    - Handlers registered with a name can be re-attached after restart
+    - export_state()/import_state() serializes handler names and priorities
+    - recover_named() re-registers all named handlers from the global registry
     """
 
     def __init__(self):
@@ -89,10 +116,33 @@ class LifecycleHookRegistry:
         self._handlers[point].append(handler)
         self._handlers[point].sort(key=lambda h: getattr(h, "_hook_priority", 50))
 
+    def register_named(
+        self, point: str, name: str, handler: Callable, priority: int = 50
+    ):
+        """Register a handler with a name for recovery after restart."""
+        if point not in LIFECYCLE_POINTS:
+            raise ValueError(
+                f"Unknown lifecycle point: {point}. Available: {list(LIFECYCLE_POINTS)}"
+            )
+        handler._hook_name = name
+        handler._hook_priority = priority
+        register_named_handler(point, name, handler, priority)
+        self._handlers[point].append(handler)
+        self._handlers[point].sort(key=lambda h: getattr(h, "_hook_priority", 50))
+
     def unregister(self, point: str, handler: Callable):
         if point in self._handlers:
             self._handlers[point] = [
                 h for h in self._handlers[point] if h is not handler
+            ]
+
+    def unregister_by_name(self, point: str, name: str):
+        """Remove a handler by its registered name."""
+        if point in self._handlers:
+            self._handlers[point] = [
+                h
+                for h in self._handlers[point]
+                if getattr(h, "_hook_name", None) != name
             ]
 
     def emit(self, point: str, context: Dict[str, Any]) -> Dict[str, Any]:
@@ -140,6 +190,42 @@ class LifecycleHookRegistry:
             "total_handlers": sum(len(hs) for hs in self._handlers.values()),
             "available_points": list(LIFECYCLE_POINTS),
         }
+
+    def export_state(self) -> Dict[str, Any]:
+        """Serialize handler registrations to a recoverable dict."""
+        state = {}
+        for point, handlers in self._handlers.items():
+            state[point] = [
+                {
+                    "name": getattr(h, "_hook_name", None),
+                    "priority": getattr(h, "_hook_priority", 50),
+                    "module": getattr(h, "__module__", ""),
+                    "qualname": getattr(h, "__qualname__", ""),
+                }
+                for h in handlers
+            ]
+        return state
+
+    def import_state(self, state: Dict[str, Any]):
+        """Recover named handlers from a previously exported state."""
+        for point, entries in state.items():
+            if point not in LIFECYCLE_POINTS:
+                continue
+            for entry in entries:
+                name = entry.get("name")
+                priority = entry.get("priority", 50)
+                if not name:
+                    continue
+                handler = get_named_handler(point, name)
+                if handler:
+                    already = any(
+                        getattr(h, "_hook_name", None) == name
+                        for h in self._handlers.get(point, [])
+                    )
+                    if not already:
+                        handler._hook_priority = priority
+                        self._handlers[point].append(handler)
+            self._handlers[point].sort(key=lambda h: getattr(h, "_hook_priority", 50))
 
 
 class SpecGate:

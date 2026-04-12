@@ -40,6 +40,7 @@ from .models import PipelinePhase, PipelineRun, Task
 logger = logging.getLogger(__name__)
 
 SESSION_EXPIRY_SECONDS = 3600
+SESSION_MAX_LIVE_SECONDS = 86400
 
 
 @dataclass
@@ -119,6 +120,13 @@ class PromptPassingSession:
         return elapsed > SESSION_EXPIRY_SECONDS
 
     @property
+    def is_dead(self) -> bool:
+        if not self.last_active_at:
+            return True
+        elapsed = (datetime.now() - self.last_active_at).total_seconds()
+        return elapsed > SESSION_MAX_LIVE_SECONDS
+
+    @property
     def rounds_remaining(self) -> int:
         return self.max_rounds - self.round_number
 
@@ -132,10 +140,11 @@ class SessionManager:
     interrupted by a pending_model_request from a skill.
     """
 
-    def __init__(self, state_dir: str = None):
+    def __init__(self, state_dir: str = None, pipeline_state_fn: Callable = None):
         self._sessions: Dict[str, PromptPassingSession] = {}
         self._pipeline_sessions: Dict[str, str] = {}
         self._state_dir = state_dir
+        self._pipeline_state_fn = pipeline_state_fn
         if state_dir:
             os.makedirs(state_dir, exist_ok=True)
             self._load_from_disk()
@@ -156,9 +165,19 @@ class SessionManager:
         if not session:
             return None
         if session.is_expired:
-            logger.warning(f"Session {session_id} expired")
-            self.remove(session_id)
-            return None
+            if session.is_dead:
+                logger.warning(f"Session {session_id} dead (max live exceeded)")
+                self.remove(session_id)
+                return None
+            if self._is_pipeline_running(session.pipeline_id):
+                session.last_active_at = datetime.now()
+                self._persist_to_disk(session)
+                logger.info(f"Session {session_id} auto-renewed for running pipeline")
+                return session
+            else:
+                logger.warning(f"Session {session_id} expired (pipeline not running)")
+                self.remove(session_id)
+                return None
         return session
 
     def load_by_pipeline(self, pipeline_id: str) -> Optional[PromptPassingSession]:
@@ -194,6 +213,23 @@ class SessionManager:
         for sid in expired:
             self.remove(sid)
         return len(expired)
+
+    def touch(self, session_id: str):
+        session = self._sessions.get(session_id)
+        if session:
+            session.last_active_at = datetime.now()
+            self._persist_to_disk(session)
+
+    def _is_pipeline_running(self, pipeline_id: str) -> bool:
+        if not pipeline_id:
+            return False
+        if self._pipeline_state_fn:
+            try:
+                state = self._pipeline_state_fn(pipeline_id)
+                return state == "running"
+            except Exception:
+                return False
+        return True
 
     def _persist_to_disk(self, session: PromptPassingSession):
         if not self._state_dir:

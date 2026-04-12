@@ -183,6 +183,10 @@ class Task:
     completed_at: Optional[datetime] = None
     retry_count: int = 0
     max_retries: int = 3
+    retry_delay_seconds: float = 30.0
+    retry_backoff_factor: float = 2.0
+    last_retry_at: Optional[datetime] = None
+    failure_history: List[Dict[str, Any]] = field(default_factory=list)
     step_count: int = 0
     max_steps: int = 50
     result: Dict[str, Any] = field(default_factory=dict)
@@ -214,6 +218,12 @@ class Task:
             else None,
             "retry_count": self.retry_count,
             "max_retries": self.max_retries,
+            "retry_delay_seconds": self.retry_delay_seconds,
+            "retry_backoff_factor": self.retry_backoff_factor,
+            "last_retry_at": self.last_retry_at.isoformat()
+            if self.last_retry_at
+            else None,
+            "failure_history": self.failure_history,
             "step_count": self.step_count,
             "max_steps": self.max_steps,
             "result": self.result,
@@ -234,6 +244,9 @@ class Task:
             depends_on=data.get("depends_on", []),
             retry_count=data.get("retry_count", 0),
             max_retries=data.get("max_retries", 3),
+            retry_delay_seconds=data.get("retry_delay_seconds", 30.0),
+            retry_backoff_factor=data.get("retry_backoff_factor", 2.0),
+            failure_history=data.get("failure_history", []),
             step_count=data.get("step_count", 0),
             max_steps=data.get("max_steps", 50),
             result=data.get("result", {}),
@@ -246,6 +259,8 @@ class Task:
             t.started_at = datetime.fromisoformat(data["started_at"])
         if data.get("completed_at"):
             t.completed_at = datetime.fromisoformat(data["completed_at"])
+        if data.get("last_retry_at"):
+            t.last_retry_at = datetime.fromisoformat(data["last_retry_at"])
         return t
 
 
@@ -329,6 +344,12 @@ class PipelineRun:
     completed_at: Optional[datetime] = None
     max_duration_hours: float = 5.0
     started_at: Optional[datetime] = None
+    recovery_count: int = 0
+    last_recovery_at: Optional[datetime] = None
+    last_checkpoint_id: str = ""
+    decision_timeout_seconds: float = 1800.0
+    last_decision_at: Optional[datetime] = None
+    phase_history: List[Dict[str, Any]] = field(default_factory=list)
 
     def __post_init__(self):
         if not self.id:
@@ -339,6 +360,23 @@ class PipelineRun:
         if not self.created_at:
             self.created_at = datetime.now()
         if not self.updated_at:
+            self.updated_at = datetime.now()
+        if not self.phase_history:
+            self.phase_history = [
+                {
+                    "phase": self.phase,
+                    "at": self.created_at.isoformat()
+                    if self.created_at
+                    else datetime.now().isoformat(),
+                }
+            ]
+
+    def record_phase(self, new_phase: str):
+        if self.phase != new_phase:
+            self.phase_history.append(
+                {"from": self.phase, "to": new_phase, "at": datetime.now().isoformat()}
+            )
+            self.phase = new_phase
             self.updated_at = datetime.now()
 
     def to_dict(self) -> Dict[str, Any]:
@@ -359,6 +397,16 @@ class PipelineRun:
             else None,
             "max_duration_hours": self.max_duration_hours,
             "started_at": self.started_at.isoformat() if self.started_at else None,
+            "recovery_count": self.recovery_count,
+            "last_recovery_at": self.last_recovery_at.isoformat()
+            if self.last_recovery_at
+            else None,
+            "last_checkpoint_id": self.last_checkpoint_id,
+            "decision_timeout_seconds": self.decision_timeout_seconds,
+            "last_decision_at": self.last_decision_at.isoformat()
+            if self.last_decision_at
+            else None,
+            "phase_history": self.phase_history,
         }
 
     @classmethod
@@ -374,6 +422,10 @@ class PipelineRun:
             decision_history=data.get("decision_history", []),
             pdca_cycle=data.get("pdca_cycle", 0),
             max_duration_hours=data.get("max_duration_hours", 5.0),
+            recovery_count=data.get("recovery_count", 0),
+            last_checkpoint_id=data.get("last_checkpoint_id", ""),
+            decision_timeout_seconds=data.get("decision_timeout_seconds", 1800.0),
+            phase_history=data.get("phase_history", []),
         )
         if data.get("created_at"):
             p.created_at = datetime.fromisoformat(data["created_at"])
@@ -383,6 +435,10 @@ class PipelineRun:
             p.completed_at = datetime.fromisoformat(data["completed_at"])
         if data.get("started_at"):
             p.started_at = datetime.fromisoformat(data["started_at"])
+        if data.get("last_recovery_at"):
+            p.last_recovery_at = datetime.fromisoformat(data["last_recovery_at"])
+        if data.get("last_decision_at"):
+            p.last_decision_at = datetime.fromisoformat(data["last_decision_at"])
         return p
 
 

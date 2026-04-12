@@ -75,6 +75,30 @@ class LoopOutcome:
             "iterations": [it.to_dict() for it in self.iterations],
         }
 
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "LoopOutcome":
+        iterations_data = data.get("iterations", [])
+        iterations = []
+        for it in iterations_data:
+            if isinstance(it, dict):
+                iterations.append(
+                    LoopIteration(
+                        iteration=it.get("iteration", 0),
+                        execution_result={"success": it.get("success", False)},
+                        refinement_applied=it.get("refinement_applied", ""),
+                    )
+                )
+        return cls(
+            task_id=data.get("task_id", ""),
+            skill_name=data.get("skill_name", ""),
+            passed=data.get("passed", False),
+            total_iterations=data.get("total_iterations", 0),
+            iterations=iterations,
+            final_result=data.get("final_result", {}),
+            escalated=data.get("escalated", False),
+            escalation_reason=data.get("escalation_reason", ""),
+        )
+
 
 class AgentLoop:
     """
@@ -359,7 +383,7 @@ class AgentLoop:
                     break
         """
         ctx = dict(context or {})
-        return LoopState(
+        state = LoopState(
             task_description=task_description,
             skill_name=skill_name,
             context=ctx,
@@ -372,7 +396,9 @@ class AgentLoop:
                 task_id=ctx.get("task_id", ""),
                 skill_name=skill_name,
             ),
+            _pass_threshold=self.pass_threshold,
         )
+        return state
 
     def receive_result(
         self,
@@ -453,6 +479,39 @@ class AgentLoop:
 
         return state
 
+    def resume_with_model(
+        self,
+        state: "LoopState",
+        model_response: str,
+    ) -> "LoopState":
+        """
+        Resume a loop that was paused for model interaction.
+
+        Takes the paused state and the model's response, creates a
+        synthetic execution result from the response, and feeds it
+        back through receive_result for evaluation.
+
+        Args:
+            state: LoopState that has needs_model=True
+            model_response: The model's response text
+
+        Returns:
+            Updated LoopState — may still need_model, be done, or
+            need another skill execution.
+        """
+        pending = state.context.get("pending_model_request", {})
+        synthetic_result = {
+            "success": True,
+            "output": model_response,
+            "artifacts": pending.get("artifacts", {}),
+        }
+
+        state.needs_model = False
+        state.context["model_response"] = model_response
+        state.context.pop("pending_model_request", None)
+
+        return self.receive_result(state, synthetic_result)
+
 
 @dataclass
 class LoopState:
@@ -467,22 +526,36 @@ class LoopState:
     needs_model: bool = False
     prompt: str = ""
     outcome: LoopOutcome = field(default_factory=LoopOutcome)
+    _pass_threshold: float = 0.6
 
     def to_dict(self) -> Dict[str, Any]:
         return {
-            "task_description": self.task_description[:200],
+            "task_description": self.task_description[:500],
             "skill_name": self.skill_name,
             "iteration": self.iteration,
             "max_iterations": self.max_iterations,
             "done": self.done,
             "needs_model": self.needs_model,
-            "prompt": self.prompt[:500],
-            "context_keys": list(self.context.keys()),
+            "prompt": self.prompt[:1000],
+            "context": {
+                k: v
+                for k, v in self.context.items()
+                if k
+                not in (
+                    "spec_context",
+                    "previous_artifacts_summary",
+                    "pending_model_request",
+                )
+            },
             "outcome": self.outcome.to_dict(),
+            "pass_threshold": self._pass_threshold,
         }
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "LoopState":
+        outcome_data = data.get("outcome", {})
+        outcome = LoopOutcome.from_dict(outcome_data) if outcome_data else LoopOutcome()
+
         return cls(
             task_description=data.get("task_description", ""),
             skill_name=data.get("skill_name", ""),
@@ -492,7 +565,6 @@ class LoopState:
             done=data.get("done", False),
             needs_model=data.get("needs_model", False),
             prompt=data.get("prompt", ""),
-            outcome=LoopOutcome.from_dict(data["outcome"])
-            if data.get("outcome")
-            else LoopOutcome(),
+            outcome=outcome,
+            _pass_threshold=data.get("pass_threshold", 0.6),
         )

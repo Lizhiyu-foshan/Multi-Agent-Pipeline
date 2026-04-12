@@ -132,6 +132,11 @@ class TaskQueue:
             task.completed_at = datetime.now()
             if result:
                 task.result = result
+            if status == "failed":
+                error_msg = ""
+                if result and isinstance(result, dict):
+                    error_msg = str(result.get("error", ""))[:500]
+                self.record_failure(task_id, error=error_msg)
         self._save()
         logger.info(f"Task {task_id}: {status}")
 
@@ -152,8 +157,103 @@ class TaskQueue:
             logger.warning(f"Task {task_id} exceeded max retries")
             return False
         task.status = "pending"
+        task.last_retry_at = datetime.now()
         self._save()
         return True
+
+    def record_failure(self, task_id: str, error: str = "", result: Dict = None):
+        """Record a task failure in its history for retry diagnostics."""
+        task = self.tasks.get(task_id)
+        if not task:
+            return
+        task.failure_history.append(
+            {
+                "attempt": task.retry_count + 1,
+                "error": error[:500],
+                "timestamp": datetime.now().isoformat(),
+                "status_at_failure": task.status,
+            }
+        )
+        if result:
+            task.result = result
+        self._save()
+
+    def get_retry_delay(self, task_id: str) -> float:
+        """Calculate retry delay with exponential backoff."""
+        task = self.tasks.get(task_id)
+        if not task:
+            return 0.0
+        delay = task.retry_delay_seconds
+        if task.retry_backoff_factor > 1 and task.retry_count > 0:
+            delay *= task.retry_backoff_factor ** (task.retry_count - 1)
+        return delay
+
+    def is_retry_ready(self, task_id: str) -> bool:
+        """Check if a failed task's retry delay has elapsed."""
+        task = self.tasks.get(task_id)
+        if not task:
+            return False
+        if task.retry_count >= task.max_retries:
+            return False
+        if not task.last_retry_at:
+            return True
+        delay = self.get_retry_delay(task_id)
+        elapsed = (datetime.now() - task.last_retry_at).total_seconds()
+        return elapsed >= delay
+
+    def get_retryable_tasks(self, pipeline_id: str = None) -> List[Task]:
+        """Get failed tasks that can be retried (delay elapsed, retries remaining)."""
+        candidates = []
+        for task in self.tasks.values():
+            if task.status != "failed":
+                continue
+            if task.retry_count >= task.max_retries:
+                continue
+            if pipeline_id and task.pipeline_id != pipeline_id:
+                continue
+            if self.is_retry_ready(task.id):
+                candidates.append(task)
+        return candidates
+
+    def retry_with_backoff(self, task_id: str, error: str = "") -> Dict:
+        """
+        Attempt to retry a failed task with backoff.
+
+        Returns dict with:
+        - 'retried': bool - whether retry was initiated
+        - 'delay': float - delay before task becomes eligible
+        - 'attempts_remaining': int
+        - 'reason': str - explanation if not retried
+        """
+        task = self.tasks.get(task_id)
+        if not task:
+            return {"retried": False, "reason": "Task not found"}
+
+        if task.status != "failed":
+            return {
+                "retried": False,
+                "reason": f"Task status is {task.status}, not failed",
+            }
+
+        self.record_failure(task_id, error)
+
+        success = self.increment_retry(task_id)
+        if not success:
+            return {
+                "retried": False,
+                "reason": "Max retries exceeded or increment failed",
+                "attempts_remaining": max(0, task.max_retries - task.retry_count),
+            }
+
+        delay = self.get_retry_delay(task_id)
+
+        return {
+            "retried": True,
+            "delay": delay,
+            "attempts_remaining": task.max_retries - task.retry_count,
+            "task_id": task_id,
+            "retry_count": task.retry_count,
+        }
 
     def get_statistics(self) -> Dict[str, int]:
         stats = {"pending": 0, "processing": 0, "completed": 0, "failed": 0}

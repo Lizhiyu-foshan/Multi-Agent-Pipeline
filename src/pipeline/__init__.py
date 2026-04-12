@@ -58,6 +58,8 @@ from .intent_gate import (
     ComplexityClass,
     AmbiguityLevel,
 )
+from .pipeline_watchdog import PipelineWatchdog, WatchdogConfig, HealthStatus
+from .metrics import PipelineMetrics
 
 try:
     from .worktree_manager import WorktreeManager
@@ -127,4 +129,8 @@ __all__ = [
     "IntentType",
     "ComplexityClass",
     "AmbiguityLevel",
+    "PipelineWatchdog",
+    "WatchdogConfig",
+    "HealthStatus",
+    "PipelineMetrics",
 ]

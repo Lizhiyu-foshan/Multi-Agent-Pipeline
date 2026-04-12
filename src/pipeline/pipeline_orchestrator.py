@@ -13,6 +13,7 @@ Key design differences from reference:
 import json
 import logging
 import os
+import threading
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -32,7 +33,7 @@ from .scheduler_api import ResourceSchedulerAPI
 from .context_manager import ContextManager
 from .checkpoint_manager import CheckpointManager
 from .execution_evaluator import ExecutionEvaluator
-from .agent_loop import AgentLoop, LoopOutcome
+from .agent_loop import AgentLoop, LoopOutcome, LoopState
 from .loop_policy import (
     LoopPolicy,
     LoopConfig,
@@ -56,6 +57,7 @@ from .intent_gate import (
     ComplexityClass,
     AmbiguityLevel,
 )
+from .metrics import PipelineMetrics
 
 try:
     from .worktree_manager import WorktreeManager
@@ -89,6 +91,7 @@ class PipelineOrchestrator:
         state_dir: str = None,
         skills: Dict[str, Any] = None,
         spec_gate: Any = None,
+        watchdog_config: Dict[str, Any] = None,
     ):
         if state_dir is None:
             state_dir = str(Path.cwd() / ".pipeline")
@@ -108,6 +111,15 @@ class PipelineOrchestrator:
 
         self.spec_gate = spec_gate
 
+        from specs.spec_gate import LifecycleHookRegistry
+
+        self._internal_hooks = LifecycleHookRegistry()
+
+        self.metrics = PipelineMetrics(state_dir=str(Path(state_dir) / "metrics"))
+
+        self._advance_dedup: Dict[str, str] = {}
+        self._advance_cache: Dict[str, Dict[str, Any]] = {}
+
         self.evaluator = ExecutionEvaluator()
         self.parallel_executor = ParallelExecutor(max_workers=3, timeout_per_task=120.0)
         self.loop_policy = LoopPolicy()
@@ -118,7 +130,8 @@ class PipelineOrchestrator:
             project_path=str(Path(state_dir).parent) if state_dir else None
         )
         self.session_manager = SessionManager(
-            state_dir=str(Path(state_dir) / "sessions")
+            state_dir=str(Path(state_dir) / "sessions"),
+            pipeline_state_fn=self._get_pipeline_state,
         )
         self.worktree_manager = (
             WorktreeManager(repo_root=str(Path(state_dir).parent))
@@ -131,7 +144,61 @@ class PipelineOrchestrator:
         )
 
         self.pipelines: Dict[str, PipelineRun] = {}
+        self._state_lock = threading.Lock()
+
+        self._watchdog = None
+        self._watchdog_config = watchdog_config
+        if watchdog_config is not False:
+            self._init_watchdog(watchdog_config or {})
+
         self._load_pipelines()
+        self._load_hooks_state()
+
+    def _init_watchdog(self, config: Dict[str, Any]):
+        from .pipeline_watchdog import PipelineWatchdog, WatchdogConfig
+
+        wd_config = WatchdogConfig(
+            check_interval_seconds=config.get("check_interval_seconds", 30.0),
+            task_stall_threshold_seconds=config.get(
+                "task_stall_threshold_seconds", 300.0
+            ),
+            session_idle_threshold_seconds=config.get(
+                "session_idle_threshold_seconds", 1800.0
+            ),
+            progress_stall_threshold_seconds=config.get(
+                "progress_stall_threshold_seconds", 600.0
+            ),
+            auto_recover=config.get("auto_recover", False),
+            max_auto_recover_attempts=config.get("max_auto_recover_attempts", 2),
+            auto_retry_stalled_tasks=config.get("auto_retry_stalled_tasks", True),
+        )
+        self._watchdog = PipelineWatchdog(orchestrator=self, config=wd_config)
+        logger.info("Watchdog initialized (auto-managed with pipeline lifecycle)")
+
+    @property
+    def watchdog(self):
+        return self._watchdog
+
+    def _watchdog_on_pipeline_start(self, pipeline_id: str):
+        if self._watchdog:
+            self._watchdog.register_pipeline(pipeline_id)
+            if not self._watchdog.is_running:
+                self._watchdog.start()
+                logger.info(f"Watchdog auto-started for pipeline {pipeline_id}")
+
+    def _watchdog_on_pipeline_end(self, pipeline_id: str):
+        if not self._watchdog:
+            return
+        self._watchdog.unregister_pipeline(pipeline_id)
+        if self._watchdog.monitored_count == 0:
+            self._watchdog.stop()
+            logger.info("Watchdog auto-stopped (no active pipelines)")
+
+    def shutdown(self):
+        self._save_hooks_state()
+        if self._watchdog:
+            self._watchdog.stop()
+        logger.info("PipelineOrchestrator shutdown complete")
 
     def _load_pipelines(self):
         pipe_file = Path(self.state_dir) / "state" / "pipelines.json"
@@ -142,30 +209,75 @@ class PipelineOrchestrator:
                 for pid, pdata in data.items():
                     self.pipelines[pid] = PipelineRun.from_dict(pdata)
                 logger.info(f"Loaded {len(self.pipelines)} pipelines")
+                self._recover_crashed_pipelines()
             except Exception as e:
                 logger.error(f"Failed to load pipelines: {e}")
 
-    def _save_pipelines(self):
-        pipe_file = Path(self.state_dir) / "state" / "pipelines.json"
-        try:
-            os.makedirs(pipe_file.parent, exist_ok=True)
-            data = {pid: p.to_dict() for pid, p in self.pipelines.items()}
-            fd, tmp = os.path.join(str(pipe_file.parent), "_tmp_pipes.json"), None
-            import tempfile
-
-            fd, tmp = tempfile.mkstemp(dir=str(pipe_file.parent), suffix=".json.tmp")
-            try:
-                with os.fdopen(fd, "w", encoding="utf-8") as f:
-                    json.dump(
-                        data, f, indent=2, ensure_ascii=False, cls=DateTimeEncoder
+    def _recover_crashed_pipelines(self):
+        """Auto-recover pipelines left in RUNNING state after a crash."""
+        crashed = [
+            p
+            for p in self.pipelines.values()
+            if p.state in (PipelineState.RUNNING.value, "running")
+            and p.phase
+            not in (
+                PipelinePhase.COMPLETED.value,
+                PipelinePhase.FAILED.value,
+            )
+        ]
+        if not crashed:
+            return
+        logger.warning(
+            f"Found {len(crashed)} pipeline(s) in RUNNING state after restart "
+            f"— auto-recovering from checkpoints"
+        )
+        for pipeline in crashed:
+            result = self.recover(pipeline.id, strategy="latest")
+            if result.get("recovered"):
+                logger.info(
+                    f"Auto-recovered pipeline {pipeline.id} "
+                    f"(phase={pipeline.phase}, recovery #{pipeline.recovery_count})"
+                )
+            else:
+                logger.warning(
+                    f"Auto-recover failed for pipeline {pipeline.id}: "
+                    f"{result.get('error', 'unknown')}. Falling back to clean strategy."
+                )
+                clean_result = self.recover(pipeline.id, strategy="clean")
+                if clean_result.get("recovered"):
+                    logger.info(
+                        f"Clean-recovered pipeline {pipeline.id} "
+                        f"(recovery #{pipeline.recovery_count})"
                     )
-                os.replace(tmp, str(pipe_file))
-            except Exception:
-                if os.path.exists(tmp):
-                    os.unlink(tmp)
-                raise
-        except Exception as e:
-            logger.error(f"Failed to save pipelines: {e}")
+                else:
+                    logger.error(
+                        f"All recovery attempts failed for pipeline {pipeline.id}. "
+                        f"Manual intervention required."
+                    )
+
+    def _save_pipelines(self):
+        with self._state_lock:
+            pipe_file = Path(self.state_dir) / "state" / "pipelines.json"
+            try:
+                os.makedirs(pipe_file.parent, exist_ok=True)
+                data = {pid: p.to_dict() for pid, p in self.pipelines.items()}
+                import tempfile
+
+                fd, tmp = tempfile.mkstemp(
+                    dir=str(pipe_file.parent), suffix=".json.tmp"
+                )
+                try:
+                    with os.fdopen(fd, "w", encoding="utf-8") as f:
+                        json.dump(
+                            data, f, indent=2, ensure_ascii=False, cls=DateTimeEncoder
+                        )
+                    os.replace(tmp, str(pipe_file))
+                except Exception:
+                    if os.path.exists(tmp):
+                        os.unlink(tmp)
+                    raise
+            except Exception as e:
+                logger.error(f"Failed to save pipelines: {e}")
 
     # ===== Pipeline Lifecycle =====
 
@@ -186,6 +298,8 @@ class PipelineOrchestrator:
         )
         self.pipelines[pipeline.id] = pipeline
         self._save_pipelines()
+
+        self.metrics.register_pipeline(pipeline.id)
 
         self.context.add_entry(
             pipeline.id, "", "orchestrator", "init", f"Pipeline created: {description}"
@@ -212,6 +326,16 @@ class PipelineOrchestrator:
             "prompt": prompt,
         }
 
+    def _idempotency_key(self, pipeline_id: str, phase: str, phase_result: Dict) -> str:
+        import hashlib
+
+        task_id = phase_result.get("task_id", "")
+        decision = phase_result.get("decision", "")
+        result_hash = hashlib.md5(
+            json.dumps(phase_result, sort_keys=True, default=str).encode()
+        ).hexdigest()[:8]
+        return f"{pipeline_id}:{phase}:{task_id}:{decision}:{result_hash}"
+
     def advance(self, pipeline_id: str, phase_result: Dict[str, Any]) -> Dict[str, Any]:
         """
         Advance pipeline to next phase based on current phase result.
@@ -230,7 +354,16 @@ class PipelineOrchestrator:
         if self._is_timed_out(pipeline):
             return self._handle_timeout(pipeline)
 
+        if self._is_decision_timed_out(pipeline):
+            return self._auto_resolve_decision(pipeline)
+
         phase = PipelinePhase(pipeline.phase)
+        dedup_key = self._idempotency_key(pipeline_id, phase.value, phase_result)
+        if dedup_key in self._advance_cache:
+            cached = dict(self._advance_cache[dedup_key])
+            cached["idempotent"] = True
+            return cached
+
         self.context.add_entry(
             pipeline.id,
             phase_result.get("task_id", ""),
@@ -241,7 +374,13 @@ class PipelineOrchestrator:
 
         handler = self._phase_handlers.get(phase)
         if handler:
-            return handler(self, pipeline, phase_result)
+            result = handler(self, pipeline, phase_result)
+            old_key = self._advance_dedup.get(pipeline_id)
+            if old_key and old_key in self._advance_cache:
+                del self._advance_cache[old_key]
+            self._advance_dedup[pipeline_id] = dedup_key
+            self._advance_cache[dedup_key] = result
+            return result
         return {"error": f"No handler for phase: {phase}"}
 
     # ===== Phase Handlers =====
@@ -274,7 +413,7 @@ class PipelineOrchestrator:
                 self._save_pipelines()
 
                 if intent_result.needs_clarification:
-                    pipeline.phase = PipelinePhase.INIT
+                    self._transition_phase(pipeline, PipelinePhase.INIT)
                     self._save_pipelines()
 
                     questions = intent_result.clarification_questions
@@ -300,6 +439,7 @@ class PipelineOrchestrator:
                         for iss in intent_result.prerequisite_issues:
                             option_lines.append(f"  ! {iss}")
 
+                    self._mark_decision_pending(pipeline)
                     return {
                         "action": "human_decision",
                         "phase": pipeline.phase,
@@ -315,10 +455,12 @@ class PipelineOrchestrator:
                 if isinstance(stored_intent, dict) and "intent_type" in stored_intent:
                     intent_result = IntentResult.from_dict(stored_intent)
 
-        pipeline.phase = PipelinePhase.ANALYZE
+        self._transition_phase(pipeline, PipelinePhase.ANALYZE)
         pipeline.state = PipelineState.RUNNING
         pipeline.started_at = datetime.now()
         self._save_pipelines()
+
+        self._watchdog_on_pipeline_start(pipeline.id)
 
         self._emit_lifecycle(
             "on_pipeline_start",
@@ -388,7 +530,7 @@ class PipelineOrchestrator:
             return self._handle_failure(pipeline, "Analysis produced no tasks", result)
 
         pipeline.artifacts["analysis"] = artifacts
-        pipeline.phase = PipelinePhase.PLAN
+        self._transition_phase(pipeline, PipelinePhase.PLAN)
         self._save_pipelines()
 
         try:
@@ -426,7 +568,7 @@ class PipelineOrchestrator:
         execution_waves = task_graph.get("execution_waves", [])
 
         pipeline.artifacts["plan"] = artifacts
-        pipeline.phase = PipelinePhase.CONFIRM_PLAN
+        self._transition_phase(pipeline, PipelinePhase.CONFIRM_PLAN)
         self._save_pipelines()
 
         self.checkpoint_mgr.create_full_snapshot(
@@ -461,6 +603,7 @@ class PipelineOrchestrator:
             ]
         )
 
+        self._mark_decision_pending(pipeline)
         return {
             "action": "human_decision",
             "phase": pipeline.phase,
@@ -482,7 +625,7 @@ class PipelineOrchestrator:
 
         if decision == "C":
             pipeline.state = PipelineState.FAILED
-            pipeline.phase = PipelinePhase.FAILED
+            self._transition_phase(pipeline, PipelinePhase.FAILED)
             self._save_pipelines()
             return {
                 "action": "completed",
@@ -491,7 +634,7 @@ class PipelineOrchestrator:
             }
 
         if decision == "B":
-            pipeline.phase = PipelinePhase.PLAN
+            self._transition_phase(pipeline, PipelinePhase.PLAN)
             self._save_pipelines()
             return {
                 "action": "call_skill",
@@ -510,7 +653,7 @@ class PipelineOrchestrator:
 
         submitted = self._submit_plan_tasks(pipeline, tasks)
         pipeline.tasks = submitted
-        pipeline.phase = PipelinePhase.EXECUTE
+        self._transition_phase(pipeline, PipelinePhase.EXECUTE)
         self._save_pipelines()
 
         return {
@@ -554,8 +697,27 @@ class PipelineOrchestrator:
         pending = task_stats.get("pending", 0)
         processing = task_stats.get("processing", 0)
 
+        retryable = self.scheduler.task_queue.get_retryable_tasks(pipeline.id)
+        for task in retryable:
+            retry_result = self.scheduler.task_queue.retry_with_backoff(task.id)
+            if retry_result.get("retried"):
+                pending += 1
+                self._emit_lifecycle(
+                    "on_retry",
+                    {
+                        "pipeline_id": pipeline.id,
+                        "task_id": task.id,
+                        "retry_count": task.retry_count,
+                        "max_retries": task.max_retries,
+                    },
+                )
+                logger.info(
+                    f"Auto-retry task {task.id} "
+                    f"(attempt {task.retry_count}/{task.max_retries})"
+                )
+
         if pending == 0 and processing == 0:
-            pipeline.phase = PipelinePhase.CHECK
+            self._transition_phase(pipeline, PipelinePhase.CHECK)
             self._save_pipelines()
             self._emit_lifecycle(
                 "on_pdca_cycle",
@@ -713,38 +875,38 @@ class PipelineOrchestrator:
             context=context,
         )
 
-        first_result = skill_adapter.execute(
-            loop_state.prompt, {**context, **loop_state.context}
-        )
+        while not loop_state.done:
+            exec_ctx = {**context, **loop_state.context}
+            exec_result = skill_adapter.execute(loop_state.prompt, exec_ctx)
+            loop_state = agent_loop.receive_result(loop_state, exec_result)
 
-        loop_state = agent_loop.receive_result(loop_state, first_result)
-
-        if loop_state.needs_model:
-            session = create_session_from_pending(
-                pending_request=first_result.get("pending_model_request", {}),
-                pipeline_id=pipeline.id,
-                task_id=task_id,
-                skill_name=skill_name,
-                action="execute_task",
-                phase=pipeline.phase,
-                context={**context, **loop_state.context},
-                loop_state=loop_state.to_dict(),
-                max_rounds=loop_config.max_iterations,
-            )
-            sid = self.session_manager.save(session)
-            return {
-                "action": "model_request",
-                "session_id": sid,
-                "pipeline_id": pipeline.id,
-                "task_id": task_id,
-                "prompt": loop_state.prompt,
-                "model_request_type": first_result.get("pending_model_request", {}).get(
-                    "type", ""
-                ),
-                "model_route": loop_config.model_route.to_dict(),
-                "round": loop_state.iteration,
-                "rounds_remaining": loop_state.max_iterations - loop_state.iteration,
-            }
+            if loop_state.needs_model:
+                session = create_session_from_pending(
+                    pending_request=exec_result.get("pending_model_request", {}),
+                    pipeline_id=pipeline.id,
+                    task_id=task_id,
+                    skill_name=skill_name,
+                    action="execute_task",
+                    phase=pipeline.phase,
+                    context={**context, **loop_state.context},
+                    loop_state=loop_state.to_dict(),
+                    max_rounds=loop_config.max_iterations,
+                )
+                sid = self.session_manager.save(session)
+                return {
+                    "action": "model_request",
+                    "session_id": sid,
+                    "pipeline_id": pipeline.id,
+                    "task_id": task_id,
+                    "prompt": loop_state.prompt,
+                    "model_request_type": exec_result.get(
+                        "pending_model_request", {}
+                    ).get("type", ""),
+                    "model_route": loop_config.model_route.to_dict(),
+                    "round": loop_state.iteration,
+                    "rounds_remaining": loop_state.max_iterations
+                    - loop_state.iteration,
+                }
 
         outcome = loop_state.outcome
 
@@ -796,6 +958,7 @@ class PipelineOrchestrator:
                 label=f"escalation_{task_id[:12]}",
             )
 
+            self._mark_decision_pending(pipeline)
             return {
                 "action": "human_decision",
                 "phase": PipelinePhase.EXECUTE,
@@ -877,7 +1040,7 @@ class PipelineOrchestrator:
         processing = task_stats.get("processing", 0)
 
         if pending == 0 and processing == 0:
-            pipeline.phase = PipelinePhase.CHECK
+            self._transition_phase(pipeline, PipelinePhase.CHECK)
             self._save_pipelines()
             self._emit_lifecycle(
                 "on_pdca_cycle",
@@ -1009,7 +1172,7 @@ class PipelineOrchestrator:
         processing = task_stats.get("processing", 0)
 
         if pending == 0 and processing == 0:
-            pipeline.phase = PipelinePhase.CHECK
+            self._transition_phase(pipeline, PipelinePhase.CHECK)
             self._save_pipelines()
             self._emit_lifecycle(
                 "on_pdca_cycle",
@@ -1066,7 +1229,7 @@ class PipelineOrchestrator:
             label=f"check_cycle_{pipeline.pdca_cycle}",
         )
 
-        pipeline.phase = PipelinePhase.DECIDE
+        self._transition_phase(pipeline, PipelinePhase.DECIDE)
         self._save_pipelines()
 
         check_msg = [
@@ -1103,6 +1266,7 @@ class PipelineOrchestrator:
         options.append("D")
         check_msg.append("[D] Pause - halt pipeline")
 
+        self._mark_decision_pending(pipeline)
         return {
             "action": "human_decision",
             "phase": pipeline.phase,
@@ -1168,7 +1332,7 @@ class PipelineOrchestrator:
         )
 
         if decision == "A":
-            pipeline.phase = PipelinePhase.EVOLVE
+            self._transition_phase(pipeline, PipelinePhase.EVOLVE)
             self._save_pipelines()
             return {
                 "action": "call_skill",
@@ -1183,7 +1347,7 @@ class PipelineOrchestrator:
             for t in pipe_tasks:
                 if t.status == "failed":
                     self.scheduler.task_queue.increment_retry(t.id)
-            pipeline.phase = PipelinePhase.EXECUTE
+            self._transition_phase(pipeline, PipelinePhase.EXECUTE)
             self._save_pipelines()
             return {
                 "action": "execute_next_task",
@@ -1192,9 +1356,10 @@ class PipelineOrchestrator:
             }
         elif decision == "C":
             pipeline.state = PipelineState.COMPLETED
-            pipeline.phase = PipelinePhase.COMPLETED
+            self._transition_phase(pipeline, PipelinePhase.COMPLETED)
             pipeline.completed_at = datetime.now()
             self._save_pipelines()
+            self._watchdog_on_pipeline_end(pipeline.id)
             self.context.save_state()
             return {
                 "action": "completed",
@@ -1203,7 +1368,7 @@ class PipelineOrchestrator:
             }
         elif decision == "D":
             pipeline.state = PipelineState.PAUSED
-            pipeline.phase = PipelinePhase.PAUSED
+            self._transition_phase(pipeline, PipelinePhase.PAUSED)
             self._save_pipelines()
             self.context.save_state()
             return {
@@ -1214,7 +1379,7 @@ class PipelineOrchestrator:
         return {"error": f"Unknown decision: {decision}"}
 
     def _handle_evolve(self, pipeline: PipelineRun, result: Dict) -> Dict:
-        pipeline.phase = PipelinePhase.VERIFY
+        self._transition_phase(pipeline, PipelinePhase.VERIFY)
         self._save_pipelines()
 
         artifacts = self.context.get_artifacts(pipeline.id)
@@ -1239,8 +1404,9 @@ class PipelineOrchestrator:
     def _handle_verify(self, pipeline: PipelineRun, result: Dict) -> Dict:
         if result.get("success"):
             pipeline.state = PipelineState.COMPLETED
-            pipeline.phase = PipelinePhase.COMPLETED
+            self._transition_phase(pipeline, PipelinePhase.COMPLETED)
             pipeline.completed_at = datetime.now()
+            self._watchdog_on_pipeline_end(pipeline.id)
             self._emit_lifecycle(
                 "on_pipeline_complete",
                 {
@@ -1251,10 +1417,10 @@ class PipelineOrchestrator:
             )
         else:
             if pipeline.pdca_cycle < 3:
-                pipeline.phase = PipelinePhase.EXECUTE
+                self._transition_phase(pipeline, PipelinePhase.EXECUTE)
             else:
                 pipeline.state = PipelineState.FAILED
-                pipeline.phase = PipelinePhase.FAILED
+                self._transition_phase(pipeline, PipelinePhase.FAILED)
         self._save_pipelines()
         self.context.save_state()
         return {
@@ -1285,22 +1451,17 @@ class PipelineOrchestrator:
         """
         Resume a paused execution after model response is provided.
 
-        This is the key method for multi-round prompt-passing:
-        1. Load the saved session state
-        2. Feed the model response back to the skill
-        3. If the skill returns another pending_model_request, save new session
-        4. If the skill completes, process the result and advance pipeline
-
-        Args:
-            session_id: The session to resume
-            model_response: The model's response text
-
-        Returns:
-            Dict with action, may contain new session_id or pipeline advancement
+        Handles two scenarios:
+        1. AgentLoop resume: session has saved loop_state with iteration > 0
+           → restore AgentLoop, feed model response, continue iterating
+        2. Simple skill resume: session has no active loop_state
+           → call skill.continue_execution, handle result
         """
         session = self.session_manager.load(session_id)
         if not session:
             return {"error": f"Session {session_id} not found or expired"}
+
+        self.session_manager.touch(session_id)
 
         pipeline = self.pipelines.get(session.pipeline_id)
         if not pipeline:
@@ -1320,6 +1481,18 @@ class PipelineOrchestrator:
         if not skill_adapter:
             self.session_manager.remove(session_id)
             return {"error": f"Skill {session.skill_name} not available"}
+
+        saved_loop_state = session.loop_state
+        has_active_loop = (
+            isinstance(saved_loop_state, dict)
+            and saved_loop_state.get("iteration", 0) > 0
+            and saved_loop_state.get("needs_model") is True
+        )
+
+        if has_active_loop and session.action == "execute_task":
+            return self._resume_agent_loop(
+                session, session_id, model_response, skill_adapter, pipeline
+            )
 
         continue_context = dict(session.context)
         continue_context["model_response"] = model_response
@@ -1387,6 +1560,137 @@ class PipelineOrchestrator:
 
         return self.advance(session.pipeline_id, phase_result)
 
+    def _resume_agent_loop(
+        self,
+        session: PromptPassingSession,
+        session_id: str,
+        model_response: str,
+        skill_adapter: Any,
+        pipeline: PipelineRun,
+    ) -> Dict[str, Any]:
+        """Resume an AgentLoop that was paused mid-iteration for model interaction."""
+        saved_ls = session.loop_state
+        loop_state = LoopState.from_dict(saved_ls)
+
+        loop_config = self.loop_policy.get_config(
+            level=ExecutionLevel.SUB_TASK,
+            role_type=session.context.get("role_id", "developer"),
+            skill_name=session.skill_name,
+        )
+
+        agent_loop = AgentLoop(
+            evaluator=self.evaluator,
+            max_iterations=loop_state.max_iterations,
+            pass_threshold=loop_state._pass_threshold,
+        )
+
+        loop_state = agent_loop.resume_with_model(loop_state, model_response)
+
+        base_context = {
+            "pipeline_id": pipeline.id,
+            "task_id": session.task_id,
+            "role_id": session.context.get("role_id", ""),
+            "project_path": str(Path(self.state_dir).parent),
+            "spec_context": self.context.get_context_for_task(
+                pipeline.id, session.task_id
+            ),
+            "previous_artifacts_summary": self.context.get_previous_artifacts_summary(
+                pipeline.id
+            ),
+            "model_route": loop_config.model_route.to_dict(),
+        }
+
+        while not loop_state.done:
+            exec_ctx = {**base_context, **loop_state.context}
+            exec_result = skill_adapter.execute(loop_state.prompt, exec_ctx)
+            loop_state = agent_loop.receive_result(loop_state, exec_result)
+
+            if loop_state.needs_model:
+                new_session = create_session_from_pending(
+                    pending_request=exec_result.get("pending_model_request", {}),
+                    pipeline_id=pipeline.id,
+                    task_id=session.task_id,
+                    skill_name=session.skill_name,
+                    action="execute_task",
+                    phase=pipeline.phase,
+                    context={**base_context, **loop_state.context},
+                    loop_state=loop_state.to_dict(),
+                    max_rounds=session.max_rounds,
+                )
+                new_session.round_number = session.round_number + 1
+                new_sid = self.session_manager.save(new_session)
+                self.session_manager.remove(session_id)
+                return {
+                    "action": "model_request",
+                    "session_id": new_sid,
+                    "pipeline_id": pipeline.id,
+                    "task_id": session.task_id,
+                    "prompt": loop_state.prompt,
+                    "model_request_type": exec_result.get(
+                        "pending_model_request", {}
+                    ).get("type", ""),
+                    "model_route": loop_config.model_route.to_dict(),
+                    "round": new_session.round_number,
+                    "rounds_remaining": new_session.rounds_remaining,
+                }
+
+        self.session_manager.remove(session_id)
+        outcome = loop_state.outcome
+
+        if outcome.passed:
+            if outcome.final_result.get("artifacts"):
+                for k, v in outcome.final_result["artifacts"].items():
+                    self.context.store_artifact(pipeline.id, session.task_id, k, v)
+            self.scheduler.complete_task(session.task_id, True, outcome.final_result)
+            self._emit_lifecycle(
+                "on_task_complete",
+                {
+                    "pipeline_id": pipeline.id,
+                    "task_id": session.task_id,
+                    "skill_name": session.skill_name,
+                    "success": True,
+                    "iterations": outcome.total_iterations,
+                    "resumed": True,
+                },
+            )
+            return {
+                "action": "execute_next_task",
+                "pipeline_id": pipeline.id,
+                "task_id": session.task_id,
+                "iterations": outcome.total_iterations,
+                "score": outcome.final_evaluation.score
+                if outcome.final_evaluation
+                else 0.0,
+            }
+
+        if outcome.escalated:
+            escalation = agent_loop.build_escalation_message(outcome)
+            self.checkpoint_mgr.create_full_snapshot(
+                pipeline,
+                self.scheduler.task_queue.get_statistics(),
+                self.scheduler.registry.get_status(),
+                label=f"escalation_{session.task_id[:12]}",
+            )
+            self._mark_decision_pending(pipeline)
+            return {
+                "action": "human_decision",
+                "phase": PipelinePhase.EXECUTE,
+                "pipeline_id": pipeline.id,
+                "task_id": session.task_id,
+                "question": escalation["question"],
+                "options": escalation["options"],
+                "escalation_context": escalation.get("escalation_context", {}),
+                "loop_outcome": outcome.to_dict(),
+            }
+
+        self.scheduler.complete_task(session.task_id, False, outcome.final_result)
+        return {
+            "action": "execute_next_task",
+            "pipeline_id": pipeline.id,
+            "task_id": session.task_id,
+            "failed": True,
+        }
+
     def get_active_session(self, pipeline_id: str) -> Optional[Dict[str, Any]]:
         """Get the active model request session for a pipeline, if any."""
         session = self.session_manager.load_by_pipeline(pipeline_id)
@@ -1401,6 +1705,12 @@ class PipelineOrchestrator:
             "rounds_remaining": session.rounds_remaining,
             "model_request_type": session.model_request_type,
         }
+
+    def _get_pipeline_state(self, pipeline_id: str) -> Optional[str]:
+        pipeline = self.pipelines.get(pipeline_id)
+        if pipeline:
+            return pipeline.state.value
+        return None
 
     # ===== Task Execution =====
 
@@ -1499,7 +1809,49 @@ class PipelineOrchestrator:
     def _emit_lifecycle(self, point: str, context: Dict[str, Any]) -> Dict[str, Any]:
         if self.spec_gate and hasattr(self.spec_gate, "emit_lifecycle"):
             return self.spec_gate.emit_lifecycle(point, context)
-        return context
+        return self._internal_hooks.emit(point, context)
+
+    def _transition_phase(self, pipeline: PipelineRun, new_phase: str):
+        old_phase = pipeline.phase
+        if old_phase == new_phase:
+            return
+        self.metrics.record_phase_exit(pipeline.id, old_phase)
+        pipeline.record_phase(new_phase)
+        self.metrics.record_phase_entry(pipeline.id, new_phase)
+
+    def _save_hooks_state(self):
+        hooks = None
+        if self.spec_gate and hasattr(self.spec_gate, "hooks"):
+            hooks = self.spec_gate.hooks
+        elif self._internal_hooks:
+            hooks = self._internal_hooks
+        if hooks:
+            try:
+                hooks_state = hooks.export_state()
+                if hooks_state:
+                    hooks_file = Path(self.state_dir) / "state" / "hooks_state.json"
+                    os.makedirs(hooks_file.parent, exist_ok=True)
+                    with open(hooks_file, "w", encoding="utf-8") as f:
+                        json.dump(hooks_state, f, indent=2)
+            except Exception as e:
+                logger.error(f"Failed to save hooks state: {e}")
+
+    def _load_hooks_state(self):
+        hooks = None
+        if self.spec_gate and hasattr(self.spec_gate, "hooks"):
+            hooks = self.spec_gate.hooks
+        elif self._internal_hooks:
+            hooks = self._internal_hooks
+        if hooks:
+            try:
+                hooks_file = Path(self.state_dir) / "state" / "hooks_state.json"
+                if hooks_file.exists():
+                    with open(hooks_file, "r", encoding="utf-8") as f:
+                        hooks_state = json.load(f)
+                    hooks.import_state(hooks_state)
+                    logger.info("Restored lifecycle hooks state from disk")
+            except Exception as e:
+                logger.error(f"Failed to load hooks state: {e}")
 
     def _is_timed_out(self, pipeline: PipelineRun) -> bool:
         if not pipeline.started_at:
@@ -1508,16 +1860,65 @@ class PipelineOrchestrator:
         elapsed = (datetime.now() - pipeline.started_at).total_seconds()
         return elapsed > max_seconds
 
+    def _is_decision_timed_out(self, pipeline: PipelineRun) -> bool:
+        if not pipeline.last_decision_at:
+            return False
+        if pipeline.phase not in (
+            PipelinePhase.CONFIRM_PLAN.value,
+            PipelinePhase.DECIDE.value,
+            PipelinePhase.PAUSED.value,
+        ):
+            return False
+        elapsed = (datetime.now() - pipeline.last_decision_at).total_seconds()
+        return elapsed > pipeline.decision_timeout_seconds
+
+    DECISION_DEFAULTS = {
+        PipelinePhase.CONFIRM_PLAN.value: "A",
+        PipelinePhase.DECIDE.value: "A",
+        PipelinePhase.PAUSED.value: "A",
+    }
+
+    def _auto_resolve_decision(self, pipeline: PipelineRun) -> Dict:
+        default = self.DECISION_DEFAULTS.get(pipeline.phase, "A")
+        logger.warning(
+            f"Decision timeout ({pipeline.decision_timeout_seconds}s) for "
+            f"pipeline {pipeline.id} at phase {pipeline.phase}. "
+            f"Auto-selecting default: {default}"
+        )
+        self.metrics.record_decision(pipeline.id, pipeline.phase, default, auto=True)
+        self._emit_lifecycle(
+            "on_error",
+            {
+                "pipeline_id": pipeline.id,
+                "reason": "decision_timeout",
+                "phase": pipeline.phase,
+                "auto_decision": default,
+            },
+        )
+        pipeline.last_decision_at = None
+        self._save_pipelines()
+
+        phase_handler = self._phase_handlers.get(PipelinePhase(pipeline.phase))
+        if phase_handler:
+            return phase_handler(self, pipeline, {"decision": default})
+        return {"action": "execute_next_task", "pipeline_id": pipeline.id}
+
+    def _mark_decision_pending(self, pipeline: PipelineRun):
+        pipeline.last_decision_at = datetime.now()
+        self._save_pipelines()
+
     def _handle_timeout(self, pipeline: PipelineRun) -> Dict:
         pipeline.state = PipelineState.PAUSED
-        pipeline.phase = PipelinePhase.PAUSED
+        self._transition_phase(pipeline, PipelinePhase.PAUSED)
         self._save_pipelines()
+        self._watchdog_on_pipeline_end(pipeline.id)
         self.checkpoint_mgr.create_full_snapshot(
             pipeline,
             self.scheduler.task_queue.get_statistics(),
             self.scheduler.registry.get_status(),
             label="timeout",
         )
+        self._mark_decision_pending(pipeline)
         return {
             "action": "human_decision",
             "phase": "paused",
@@ -1541,8 +1942,9 @@ class PipelineOrchestrator:
             },
         )
         pipeline.state = PipelineState.FAILED
-        pipeline.phase = PipelinePhase.FAILED
+        self._transition_phase(pipeline, PipelinePhase.FAILED)
         self._save_pipelines()
+        self._watchdog_on_pipeline_end(pipeline.id)
         return {
             "action": "failed",
             "phase": "failed",
@@ -1563,19 +1965,170 @@ class PipelineOrchestrator:
         latest = self.checkpoint_mgr.restore_latest(pipeline_id)
         if latest and latest.get("snapshot", {}).get("pipeline"):
             restored = PipelineRun.from_dict(latest["snapshot"]["pipeline"])
-            pipeline.phase = restored.phase
+            self._transition_phase(pipeline, restored.phase)
             pipeline.started_at = restored.started_at
 
         pipeline.state = PipelineState.RUNNING
         if pipeline.phase == PipelinePhase.PAUSED:
-            pipeline.phase = PipelinePhase.EXECUTE
+            self._transition_phase(pipeline, PipelinePhase.EXECUTE)
         self._save_pipelines()
+        self._watchdog_on_pipeline_start(pipeline.id)
 
         return {
             "action": "execute_next_task",
             "pipeline_id": pipeline.id,
             "phase": pipeline.phase,
         }
+
+    def recover(self, pipeline_id: str, strategy: str = "latest") -> Dict[str, Any]:
+        """
+        Recover a pipeline from crash or failure using checkpoints.
+
+        Strategies:
+        - 'latest': restore from most recent checkpoint
+        - 'phase': restore to last known stable phase (EXECUTE if was in CHECK/DECIDE,
+          otherwise rewind one phase)
+        - 'clean': reset to EXECUTE phase with tasks needing retry
+        - 'force': recover even FAILED/IDLE pipelines
+
+        Returns action dict indicating next step, or error.
+        """
+        pipeline = self.pipelines.get(pipeline_id)
+        if not pipeline:
+            return {"error": f"Pipeline {pipeline_id} not found"}
+
+        recoverable_states = {
+            PipelineState.PAUSED,
+            PipelineState.FAILED,
+            PipelineState.RUNNING,
+        }
+        if pipeline.state not in recoverable_states and strategy != "force":
+            return {
+                "error": f"Pipeline is {pipeline.state}, not recoverable. "
+                f"Use strategy='force' to override."
+            }
+
+        checkpoint = None
+        if strategy in ("latest", "force"):
+            checkpoint = self.checkpoint_mgr.restore_latest(pipeline_id)
+        elif strategy == "phase":
+            stable_phases = [PipelinePhase.EXECUTE, PipelinePhase.PLAN]
+            for sp in stable_phases:
+                checkpoint = self.checkpoint_mgr.restore_to_phase(pipeline_id, sp.value)
+                if checkpoint:
+                    break
+            if not checkpoint:
+                checkpoint = self.checkpoint_mgr.restore_latest(pipeline_id)
+        elif strategy == "clean":
+            pipeline.state = PipelineState.RUNNING
+            self._transition_phase(pipeline, PipelinePhase.EXECUTE)
+            self._recover_reset_tasks(pipeline)
+            pipeline.recovery_count += 1
+            pipeline.last_recovery_at = datetime.now()
+            self._save_pipelines()
+            self._watchdog_on_pipeline_start(pipeline.id)
+
+            self._emit_lifecycle(
+                "on_recover",
+                {
+                    "pipeline_id": pipeline.id,
+                    "strategy": strategy,
+                    "recovery_count": pipeline.recovery_count,
+                    "phase": pipeline.phase,
+                },
+            )
+            self.metrics.record_recovery(pipeline.id, strategy, True)
+            return {
+                "action": "execute_next_task",
+                "pipeline_id": pipeline.id,
+                "phase": pipeline.phase,
+                "recovered": True,
+                "strategy": strategy,
+            }
+        else:
+            return {"error": f"Unknown recovery strategy: {strategy}"}
+
+        if not checkpoint:
+            return {"error": f"No checkpoint found for pipeline {pipeline_id}"}
+
+        snapshot = checkpoint.get("snapshot", {})
+        ckpt_pipeline_data = snapshot.get("pipeline")
+        if not ckpt_pipeline_data:
+            return {"error": "Checkpoint has no pipeline snapshot"}
+
+        restored = PipelineRun.from_dict(ckpt_pipeline_data)
+        self._transition_phase(pipeline, restored.phase)
+        pipeline.artifacts = restored.artifacts
+        pipeline.decision_history = restored.decision_history
+        pipeline.pdca_cycle = restored.pdca_cycle
+        pipeline.roles = restored.roles
+        pipeline.started_at = restored.started_at
+
+        if strategy == "force" and restored.state == "failed":
+            pipeline.state = PipelineState.RUNNING
+        elif pipeline.state == PipelineState.FAILED:
+            pipeline.state = PipelineState.RUNNING
+
+        tasks_snapshot = snapshot.get("task_queue_snapshot", {})
+        if tasks_snapshot:
+            self._recover_tasks_from_snapshot(pipeline, tasks_snapshot)
+
+        pipeline.recovery_count += 1
+        pipeline.last_recovery_at = datetime.now()
+        pipeline.last_checkpoint_id = checkpoint.get("id", "")
+        self._save_pipelines()
+
+        self._watchdog_on_pipeline_start(pipeline.id)
+
+        self._emit_lifecycle(
+            "on_recover",
+            {
+                "pipeline_id": pipeline.id,
+                "strategy": strategy,
+                "recovery_count": pipeline.recovery_count,
+                "phase": pipeline.phase,
+                "checkpoint_id": pipeline.last_checkpoint_id,
+            },
+        )
+        self.metrics.record_recovery(pipeline.id, strategy, True)
+
+        return {
+            "action": "execute_next_task",
+            "pipeline_id": pipeline.id,
+            "phase": pipeline.phase,
+            "recovered": True,
+            "strategy": strategy,
+            "checkpoint_id": pipeline.last_checkpoint_id,
+            "restored_phase": restored.phase,
+        }
+
+    def _recover_tasks_from_snapshot(self, pipeline: PipelineRun, tasks_snapshot: Dict):
+        """Restore task queue state from a checkpoint snapshot."""
+        tasks_list = tasks_snapshot.get("tasks", [])
+        for task_data in tasks_list:
+            if not isinstance(task_data, dict):
+                continue
+            task_id = task_data.get("id", "")
+            existing = self.scheduler.task_queue.get(task_id)
+            if existing:
+                if existing.status in ("completed",):
+                    continue
+                existing.status = task_data.get("status", "pending")
+                existing.result = task_data.get("result", {})
+            else:
+                restored_task = Task.from_dict(task_data)
+                self.scheduler.task_queue.tasks[task_id] = restored_task
+        self.scheduler.task_queue._save()
+
+    def _recover_reset_tasks(self, pipeline: PipelineRun):
+        """Reset failed/processing tasks to pending for clean recovery."""
+        pipe_tasks = self.scheduler.task_queue.get_by_pipeline(pipeline.id)
+        for task in pipe_tasks:
+            if task.status in ("failed", "processing"):
+                if task.retry_count < task.max_retries:
+                    task.status = "pending"
+                    task.retry_count += 1
+        self.scheduler.task_queue._save()
 
     def get_pipeline_status(self, pipeline_id: str) -> Optional[Dict]:
         pipeline = self.pipelines.get(pipeline_id)
@@ -1605,6 +2158,104 @@ class PipelineOrchestrator:
             "task_statistics": task_stats,
         }
 
+    def get_progress_report(self, pipeline_id: str) -> Optional[Dict[str, Any]]:
+        pipeline = self.pipelines.get(pipeline_id)
+        if not pipeline:
+            return None
+
+        pipe_tasks = self.scheduler.task_queue.get_by_pipeline(pipeline_id)
+        total = len(pipe_tasks)
+        by_status: Dict[str, int] = {}
+        for t in pipe_tasks:
+            by_status[t.status] = by_status.get(t.status, 0) + 1
+        completed = by_status.get("completed", 0)
+        failed = by_status.get("failed", 0)
+        progress_pct = (completed / total * 100) if total > 0 else 0.0
+
+        task_details = []
+        for t in pipe_tasks:
+            entry: Dict[str, Any] = {
+                "id": t.id,
+                "name": t.name,
+                "status": t.status,
+                "role_id": t.role_id,
+                "priority": t.priority,
+                "retry_count": t.retry_count,
+                "depends_on": t.depends_on,
+            }
+            if t.started_at:
+                entry["started_at"] = t.started_at.isoformat()
+            if t.completed_at:
+                entry["completed_at"] = t.completed_at.isoformat()
+                if t.started_at:
+                    entry["duration_seconds"] = round(
+                        (t.completed_at - t.started_at).total_seconds(), 1
+                    )
+            task_details.append(entry)
+
+        elapsed_min = 0.0
+        if pipeline.started_at:
+            elapsed_min = round(
+                (datetime.now() - pipeline.started_at).total_seconds() / 60, 1
+            )
+
+        eta_min = None
+        if total > 0 and completed > 0 and pipeline.started_at:
+            avg_task_min = elapsed_min / completed
+            remaining = total - completed
+            eta_min = round(avg_task_min * remaining, 1)
+
+        phase_timeline = []
+        for entry in pipeline.phase_history:
+            phase_timeline.append(entry)
+
+        checkpoint_count = len(self.checkpoint_mgr.list_checkpoints(pipeline_id))
+
+        budget = (
+            self.context.get_budget_usage(pipeline_id)
+            if hasattr(self.context, "get_budget_usage")
+            else None
+        )
+
+        active_session = self.get_active_session(pipeline_id)
+
+        role_status = {}
+        if hasattr(self.scheduler, "roles"):
+            role_status = (
+                self.scheduler.roles.get_status()
+                if hasattr(self.scheduler.roles, "get_status")
+                else {}
+            )
+
+        return {
+            "id": pipeline.id,
+            "description": pipeline.description,
+            "state": pipeline.state,
+            "phase": pipeline.phase,
+            "progress_pct": round(progress_pct, 1),
+            "tasks": {
+                "total": total,
+                "completed": completed,
+                "failed": failed,
+                "processing": by_status.get("processing", 0),
+                "pending": by_status.get("pending", 0),
+                "ready": by_status.get("ready", 0),
+                "blocked": by_status.get("blocked", 0),
+                "by_status": by_status,
+            },
+            "task_details": task_details,
+            "phase_timeline": phase_timeline,
+            "pdca_cycle": pipeline.pdca_cycle,
+            "elapsed_minutes": elapsed_min,
+            "eta_minutes": eta_min,
+            "checkpoint_count": checkpoint_count,
+            "recovery_count": pipeline.recovery_count,
+            "decision_count": len(pipeline.decision_history),
+            "context_budget": budget,
+            "active_session": active_session,
+            "role_status": role_status,
+        }
+
     def list_pipelines(self) -> List[Dict]:
         return [
             {
@@ -1629,3 +2280,4 @@ class PipelineOrchestrator:
         for pid in list(self.pipelines.keys()):
             self.checkpoint_mgr.cleanup_old(pid, keep=5)
         self.context.save_state()
+        self._save_hooks_state()
