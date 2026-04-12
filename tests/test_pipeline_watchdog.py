@@ -25,6 +25,7 @@ class MockOrchestrator:
         self.pipelines = {}
         self.scheduler = MockScheduler()
         self.recovery_calls = []
+        self.session_manager = MockSessionManager()
 
     def add_pipeline(
         self, pipeline_id, state=PipelineState.RUNNING, phase=PipelinePhase.EXECUTE
@@ -78,6 +79,22 @@ class MockScheduler:
 
     def get_by_pipeline(self, pipeline_id):
         return [t for t in self.tasks.values() if t.pipeline_id == pipeline_id]
+
+
+class MockSessionManager:
+    def __init__(self):
+        self._by_pipeline = {}
+
+    def set_session(self, pipeline_id, session):
+        self._by_pipeline[pipeline_id] = session
+
+    def load_by_pipeline(self, pipeline_id):
+        return self._by_pipeline.get(pipeline_id)
+
+
+class MockSession:
+    def __init__(self, last_active_at):
+        self.last_active_at = last_active_at
 
 
 class MockTaskQueue:
@@ -209,6 +226,39 @@ class TestHealthCheck:
         health = wd.check("pipe_1")
 
         assert health.status == HealthStatus.HEALTHY
+
+    def test_check_uses_pipeline_scoped_task_stats(self):
+        orch = MockOrchestrator()
+        orch.add_pipeline("pipe_1")
+        orch.add_pipeline("pipe_2")
+
+        orch.scheduler.add_task("t1", "pipe_1", status="completed")
+        orch.scheduler.add_task("t2", "pipe_1", status="failed")
+        orch.scheduler.add_task("t3", "pipe_2", status="processing")
+
+        wd = PipelineWatchdog(orchestrator=orch, config=WatchdogConfig())
+        health = wd.check("pipe_1")
+
+        assert health.task_stats["completed"] == 1
+        assert health.task_stats["failed"] == 1
+        assert health.task_stats["processing"] == 0
+
+    def test_check_warns_on_idle_active_session(self):
+        orch = MockOrchestrator()
+        orch.add_pipeline("pipe_1")
+        orch.session_manager.set_session(
+            "pipe_1",
+            MockSession(last_active_at=datetime.now() - timedelta(seconds=4000)),
+        )
+
+        wd = PipelineWatchdog(
+            orchestrator=orch,
+            config=WatchdogConfig(session_idle_threshold_seconds=1800),
+        )
+        health = wd.check("pipe_1")
+
+        assert health.status in (HealthStatus.WARNING, HealthStatus.STALLED)
+        assert any("session idle" in i.lower() for i in health.issues)
 
 
 class TestTakeAction:

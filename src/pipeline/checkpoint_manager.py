@@ -63,6 +63,7 @@ class CheckpointManager:
     ) -> Checkpoint:
         current = {
             "pipeline": pipeline_run.to_dict(),
+            "task_queue_snapshot": task_queue_snapshot,
             "tasks": task_queue_snapshot,
             "roles": roles_snapshot,
             "context_summary": context_summary,
@@ -121,12 +122,14 @@ class CheckpointManager:
         else:
             delta["pipeline_delta"] = None
 
-        prev_tasks = previous.get("tasks", {})
-        curr_tasks = current.get("tasks", {})
+        prev_tasks = previous.get("task_queue_snapshot", previous.get("tasks", {}))
+        curr_tasks = current.get("task_queue_snapshot", current.get("tasks", {}))
         if curr_tasks != prev_tasks:
+            delta["task_queue_snapshot"] = curr_tasks
             delta["tasks"] = curr_tasks
             has_changes = True
         else:
+            delta["task_queue_snapshot"] = None
             delta["tasks"] = None
 
         delta["roles"] = (
@@ -157,8 +160,10 @@ class CheckpointManager:
             pipeline.update(pipe_delta)
             result["pipeline"] = pipeline
 
-        if delta.get("tasks") is not None:
-            result["tasks"] = delta["tasks"]
+        tasks_delta = delta.get("task_queue_snapshot", delta.get("tasks"))
+        if tasks_delta is not None:
+            result["task_queue_snapshot"] = tasks_delta
+            result["tasks"] = tasks_delta
         if delta.get("roles") is not None:
             result["roles"] = delta["roles"]
         result["context_summary"] = delta.get("context_summary", "")

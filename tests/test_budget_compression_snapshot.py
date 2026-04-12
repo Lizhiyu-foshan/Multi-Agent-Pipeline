@@ -138,6 +138,8 @@ class TestIncrementalSnapshots:
         )
         assert ckpt.snapshot.get("is_delta") is not True
         assert "pipeline" in ckpt.snapshot
+        assert "task_queue_snapshot" in ckpt.snapshot
+        assert ckpt.snapshot["task_queue_snapshot"]["pending"] == 1
 
     def test_identical_snapshot_produces_no_delta(self, temp_dir):
         cm = CheckpointManager(state_dir=temp_dir)
@@ -182,6 +184,7 @@ class TestIncrementalSnapshots:
         assert "pipeline" in snap
         assert snap["pipeline"]["phase"] == PipelinePhase.EXECUTE.value
         assert snap["pipeline"]["tasks"] == ["task_1", "task_2"]
+        assert snap["task_queue_snapshot"]["pending"] == 2
 
     def test_multiple_deltas_chain(self, temp_dir):
         cm = CheckpointManager(state_dir=temp_dir)

@@ -571,10 +571,8 @@ class PipelineOrchestrator:
         self._transition_phase(pipeline, PipelinePhase.CONFIRM_PLAN)
         self._save_pipelines()
 
-        self.checkpoint_mgr.create_full_snapshot(
+        self._create_checkpoint(
             pipeline,
-            self.scheduler.task_queue.get_statistics(),
-            self.scheduler.registry.get_status(),
             label="pre_confirm",
         )
 
@@ -692,6 +690,16 @@ class PipelineOrchestrator:
                 task = self.scheduler.task_queue.get(task_id)
                 if task:
                     self.scheduler.complete_task(task_id, True, task_result)
+                    self.metrics.record_task_complete(pipeline.id, task_id)
+            else:
+                task = self.scheduler.task_queue.get(task_id)
+                if task:
+                    self.scheduler.complete_task(task_id, False, task_result)
+                    self.metrics.record_task_fail(
+                        pipeline.id,
+                        task_id,
+                        retry_count=task.retry_count,
+                    )
 
         task_stats = self.scheduler.task_queue.get_statistics()
         pending = task_stats.get("pending", 0)
@@ -702,6 +710,11 @@ class PipelineOrchestrator:
             retry_result = self.scheduler.task_queue.retry_with_backoff(task.id)
             if retry_result.get("retried"):
                 pending += 1
+                self.metrics.record_task_retry(
+                    pipeline.id,
+                    task.id,
+                    attempt=retry_result.get("retry_count", task.retry_count),
+                )
                 self._emit_lifecycle(
                     "on_retry",
                     {
@@ -811,6 +824,7 @@ class PipelineOrchestrator:
                 "role_id": role_id,
             },
         )
+        self.metrics.record_task_start(pipeline.id, task_id)
 
         active_service = task_data.get("active_service")
 
@@ -844,14 +858,24 @@ class PipelineOrchestrator:
             if result.get("success") and result.get("artifacts"):
                 for k, v in result["artifacts"].items():
                     self.context.store_artifact(pipeline.id, task_id, k, v)
-            self.scheduler.complete_task(task_id, result.get("success", True), result)
+            success = result.get("success", True)
+            self.scheduler.complete_task(task_id, success, result)
+            if success:
+                self.metrics.record_task_complete(pipeline.id, task_id)
+            else:
+                task_obj = self.scheduler.task_queue.get(task_id)
+                self.metrics.record_task_fail(
+                    pipeline.id,
+                    task_id,
+                    retry_count=task_obj.retry_count if task_obj else 0,
+                )
             self._emit_lifecycle(
                 "on_task_complete",
                 {
                     "pipeline_id": pipeline.id,
                     "task_id": task_id,
                     "skill_name": skill_name,
-                    "success": result.get("success", True),
+                    "success": success,
                     "artifacts": result.get("artifacts", {}),
                 },
             )
@@ -915,6 +939,7 @@ class PipelineOrchestrator:
                 for k, v in outcome.final_result["artifacts"].items():
                     self.context.store_artifact(pipeline.id, task_id, k, v)
             self.scheduler.complete_task(task_id, True, outcome.final_result)
+            self.metrics.record_task_complete(pipeline.id, task_id)
             self._emit_lifecycle(
                 "on_task_complete",
                 {
@@ -951,10 +976,8 @@ class PipelineOrchestrator:
             escalation["pipeline_id"] = pipeline.id
             escalation["task_id"] = task_id
 
-            self.checkpoint_mgr.create_full_snapshot(
+            self._create_checkpoint(
                 pipeline,
-                self.scheduler.task_queue.get_statistics(),
-                self.scheduler.registry.get_status(),
                 label=f"escalation_{task_id[:12]}",
             )
 
@@ -985,14 +1008,13 @@ class PipelineOrchestrator:
             f"Parallel dispatching {len(ready_tasks)} tasks for pipeline {pipeline.id}"
         )
 
-        self.checkpoint_mgr.create_full_snapshot(
+        self._create_checkpoint(
             pipeline,
-            self.scheduler.task_queue.get_statistics(),
-            self.scheduler.registry.get_status(),
             label=f"pre_parallel_{len(ready_tasks)}",
         )
 
         for task_data in ready_tasks:
+            self.metrics.record_task_start(pipeline.id, task_data.get("task_id", ""))
             self._emit_lifecycle(
                 "on_task_start",
                 {
@@ -1024,6 +1046,15 @@ class PipelineOrchestrator:
                     "artifacts": pr.artifacts,
                 },
             )
+            if pr.success:
+                self.metrics.record_task_complete(pipeline.id, pr.task_id)
+            else:
+                task_obj = self.scheduler.task_queue.get(pr.task_id)
+                self.metrics.record_task_fail(
+                    pipeline.id,
+                    pr.task_id,
+                    retry_count=task_obj.retry_count if task_obj else 0,
+                )
             self._emit_lifecycle(
                 "on_task_complete",
                 {
@@ -1222,10 +1253,8 @@ class PipelineOrchestrator:
 
         root_causes = self._analyze_failure_root_causes(issues)
 
-        self.checkpoint_mgr.create_full_snapshot(
+        self._create_checkpoint(
             pipeline,
-            task_stats,
-            self.scheduler.registry.get_status(),
             label=f"check_cycle_{pipeline.pdca_cycle}",
         )
 
@@ -1431,6 +1460,37 @@ class PipelineOrchestrator:
             "pipeline_id": pipeline.id,
         }
 
+    def _handle_paused(self, pipeline: PipelineRun, result: Dict) -> Dict:
+        decision = str(result.get("decision", "")).strip().upper()
+        if decision == "A":
+            # Resume pipeline execution after timeout/pause
+            pipeline.last_decision_at = None
+            self._save_pipelines()
+            return self.resume_pipeline(pipeline.id)
+
+        if decision == "B":
+            pipeline.last_decision_at = None
+            self._save_pipelines()
+            return self._handle_failure(
+                pipeline,
+                "Paused pipeline stopped by decision",
+                {"decision": "B", "phase": pipeline.phase},
+            )
+
+        # Missing/invalid decision: stay paused and ask explicitly
+        self._mark_decision_pending(pipeline)
+        return {
+            "action": "human_decision",
+            "phase": "paused",
+            "pipeline_id": pipeline.id,
+            "question": "Pipeline is paused. Choose next action:",
+            "options": ["A", "B"],
+            "option_labels": {
+                "A": "Resume - continue pipeline execution",
+                "B": "Stop - mark pipeline as failed",
+            },
+        }
+
     _phase_handlers = {
         PipelinePhase.INIT: _handle_init,
         PipelinePhase.ANALYZE: _handle_analyze,
@@ -1441,6 +1501,7 @@ class PipelineOrchestrator:
         PipelinePhase.DECIDE: _handle_decide,
         PipelinePhase.EVOLVE: _handle_evolve,
         PipelinePhase.VERIFY: _handle_verify,
+        PipelinePhase.PAUSED: _handle_paused,
     }
 
     # ===== Multi-Round Prompt Passing =====
@@ -1665,10 +1726,8 @@ class PipelineOrchestrator:
 
         if outcome.escalated:
             escalation = agent_loop.build_escalation_message(outcome)
-            self.checkpoint_mgr.create_full_snapshot(
+            self._create_checkpoint(
                 pipeline,
-                self.scheduler.task_queue.get_statistics(),
-                self.scheduler.registry.get_status(),
                 label=f"escalation_{session.task_id[:12]}",
             )
             self._mark_decision_pending(pipeline)
@@ -1684,6 +1743,12 @@ class PipelineOrchestrator:
             }
 
         self.scheduler.complete_task(session.task_id, False, outcome.final_result)
+        task_obj = self.scheduler.task_queue.get(session.task_id)
+        self.metrics.record_task_fail(
+            pipeline.id,
+            session.task_id,
+            retry_count=task_obj.retry_count if task_obj else 0,
+        )
         return {
             "action": "execute_next_task",
             "pipeline_id": pipeline.id,
@@ -1715,21 +1780,45 @@ class PipelineOrchestrator:
     # ===== Task Execution =====
 
     def _submit_plan_tasks(self, pipeline: PipelineRun, tasks: List[Dict]) -> List[str]:
-        task_ids = []
+        task_ids: List[str] = []
+        name_to_id: Dict[str, str] = {}
+        pending_defs: List[Dict[str, Any]] = []
+
         for tdef in tasks:
             role_id = tdef.get("role_id", tdef.get("role", "developer"))
+            task_name = tdef.get("name", tdef.get("title", "Unnamed task"))
             task_data = {
                 "pipeline_id": pipeline.id,
                 "role_id": role_id,
-                "name": tdef.get("name", tdef.get("title", "Unnamed task")),
+                "name": task_name,
                 "description": tdef.get("description", ""),
                 "priority": tdef.get("priority", "P2"),
-                "depends_on": tdef.get("depends_on", []),
+                "depends_on": [],
                 "max_steps": tdef.get("max_steps", 50),
             }
             result = self.scheduler.submit_task(task_data)
             if result["success"]:
-                task_ids.append(result["task_id"])
+                task_id = result["task_id"]
+                task_ids.append(task_id)
+                name_to_id[task_name] = task_id
+                pending_defs.append(tdef)
+
+        # Normalize dependencies to task IDs (supports mixed name/id input)
+        deps_updated = False
+        for task_id, tdef in zip(task_ids, pending_defs):
+            task = self.scheduler.task_queue.get(task_id)
+            if not task:
+                continue
+            normalized_deps: List[str] = []
+            for dep in tdef.get("depends_on", []) or []:
+                if dep in name_to_id:
+                    normalized_deps.append(name_to_id[dep])
+                elif self.scheduler.task_queue.get(str(dep)):
+                    normalized_deps.append(str(dep))
+            task.depends_on = normalized_deps
+            deps_updated = True
+        if deps_updated:
+            self.scheduler.task_queue._save()
         return task_ids
 
     def _get_next_ready_task(self, pipeline: PipelineRun) -> Optional[Dict]:
@@ -1819,6 +1908,21 @@ class PipelineOrchestrator:
         pipeline.record_phase(new_phase)
         self.metrics.record_phase_entry(pipeline.id, new_phase)
 
+    def _create_checkpoint(
+        self,
+        pipeline: PipelineRun,
+        label: str,
+        context_summary: str = "",
+    ):
+        self.checkpoint_mgr.create_full_snapshot(
+            pipeline,
+            self.scheduler.task_queue.get_statistics(),
+            self.scheduler.registry.get_status(),
+            context_summary=context_summary,
+            label=label,
+        )
+        self.metrics.record_checkpoint(pipeline.id)
+
     def _save_hooks_state(self):
         hooks = None
         if self.spec_gate and hasattr(self.spec_gate, "hooks"):
@@ -1864,6 +1968,7 @@ class PipelineOrchestrator:
         if not pipeline.last_decision_at:
             return False
         if pipeline.phase not in (
+            PipelinePhase.INIT.value,
             PipelinePhase.CONFIRM_PLAN.value,
             PipelinePhase.DECIDE.value,
             PipelinePhase.PAUSED.value,
@@ -1873,6 +1978,7 @@ class PipelineOrchestrator:
         return elapsed > pipeline.decision_timeout_seconds
 
     DECISION_DEFAULTS = {
+        PipelinePhase.INIT.value: "A",
         PipelinePhase.CONFIRM_PLAN.value: "A",
         PipelinePhase.DECIDE.value: "A",
         PipelinePhase.PAUSED.value: "A",
@@ -1912,10 +2018,8 @@ class PipelineOrchestrator:
         self._transition_phase(pipeline, PipelinePhase.PAUSED)
         self._save_pipelines()
         self._watchdog_on_pipeline_end(pipeline.id)
-        self.checkpoint_mgr.create_full_snapshot(
+        self._create_checkpoint(
             pipeline,
-            self.scheduler.task_queue.get_statistics(),
-            self.scheduler.registry.get_status(),
             label="timeout",
         )
         self._mark_decision_pending(pipeline)
@@ -2069,7 +2173,7 @@ class PipelineOrchestrator:
         elif pipeline.state == PipelineState.FAILED:
             pipeline.state = PipelineState.RUNNING
 
-        tasks_snapshot = snapshot.get("task_queue_snapshot", {})
+        tasks_snapshot = snapshot.get("task_queue_snapshot", snapshot.get("tasks", {}))
         if tasks_snapshot:
             self._recover_tasks_from_snapshot(pipeline, tasks_snapshot)
 

@@ -434,5 +434,127 @@ class TestRecoverEmitLifecycle:
         assert lifecycle_calls[0][1]["pipeline_id"] == pipeline.id
 
 
+class TestSubmitPlanTasksDependencyNormalization:
+    def test_submit_plan_tasks_maps_named_dependencies_to_task_ids(self, orchestrator):
+        pipeline, _ = orchestrator.create_pipeline("Dependency normalization")
+        orchestrator.scheduler.registry.register("developer", "Dev", ["code"])
+
+        plan_tasks = [
+            {
+                "name": "Task A",
+                "role_id": "developer",
+                "description": "base",
+                "priority": "P1",
+                "depends_on": [],
+            },
+            {
+                "name": "Task B",
+                "role_id": "developer",
+                "description": "needs A",
+                "priority": "P1",
+                "depends_on": ["Task A"],
+            },
+        ]
+
+        task_ids = orchestrator._submit_plan_tasks(pipeline, plan_tasks)
+        assert len(task_ids) == 2
+
+        task_a = orchestrator.scheduler.task_queue.get(task_ids[0])
+        task_b = orchestrator.scheduler.task_queue.get(task_ids[1])
+        assert task_a is not None
+        assert task_b is not None
+        assert task_b.depends_on == [task_a.id]
+
+    def test_submit_plan_tasks_preserves_task_id_dependencies(self, orchestrator):
+        pipeline, _ = orchestrator.create_pipeline("Dependency normalization ids")
+        orchestrator.scheduler.registry.register("developer", "Dev", ["code"])
+
+        first = orchestrator.scheduler.submit_task(
+            {
+                "pipeline_id": pipeline.id,
+                "role_id": "developer",
+                "name": "Existing",
+                "description": "existing task",
+                "priority": "P1",
+                "depends_on": [],
+            }
+        )
+        first_id = first["task_id"]
+
+        plan_tasks = [
+            {
+                "name": "Task C",
+                "role_id": "developer",
+                "description": "depends on existing id",
+                "priority": "P1",
+                "depends_on": [first_id],
+            }
+        ]
+
+        task_ids = orchestrator._submit_plan_tasks(pipeline, plan_tasks)
+        created = orchestrator.scheduler.task_queue.get(task_ids[0])
+        assert created is not None
+        assert created.depends_on == [first_id]
+
+
+class TestMetricsInstrumentation:
+    def test_checkpoint_metric_recorded_on_plan(self, orchestrator):
+        pipeline, _ = orchestrator.create_pipeline("Metrics checkpoint")
+        pipeline.phase = PipelinePhase.PLAN
+        orchestrator._save_pipelines()
+
+        plan_result = {
+            "success": True,
+            "artifacts": {
+                "task_graph": {
+                    "tasks": [
+                        {
+                            "name": "Task 1",
+                            "role_id": "developer",
+                            "description": "x",
+                            "priority": "P1",
+                            "depends_on": [],
+                        }
+                    ]
+                }
+            },
+        }
+
+        result = orchestrator.advance(pipeline.id, plan_result)
+        assert result.get("action") == "human_decision"
+
+        m = orchestrator.metrics.get_metrics(pipeline.id)
+        assert m is not None
+        assert m["checkpoints"] >= 1
+
+    def test_task_start_complete_metrics_recorded(self, orchestrator):
+        pipeline, _ = orchestrator.create_pipeline("Metrics task")
+        pipeline.phase = PipelinePhase.EXECUTE
+        pipeline.state = PipelineState.RUNNING
+        orchestrator._save_pipelines()
+
+        orchestrator.scheduler.registry.register("analyst", "Analyst", ["analyze"])
+        t = orchestrator.scheduler.submit_task(
+            {
+                "pipeline_id": pipeline.id,
+                "role_id": "analyst",
+                "name": "Task 1",
+                "description": "d",
+                "priority": "P1",
+                "depends_on": [],
+            }
+        )
+        pipeline.tasks = [t["task_id"]]
+        orchestrator._save_pipelines()
+
+        r = orchestrator.advance(pipeline.id, {"task_id": "", "skill": "superpowers"})
+        assert "action" in r
+
+        m = orchestrator.metrics.get_metrics(pipeline.id)
+        assert m is not None
+        assert m["tasks"]["started"] >= 1
+        assert m["tasks"]["completed"] + m["tasks"]["failed"] >= 1
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

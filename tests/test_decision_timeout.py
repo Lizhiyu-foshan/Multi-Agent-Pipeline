@@ -77,6 +77,18 @@ class TestIsDecisionTimedOut:
         pipeline.last_decision_at = datetime.now() - timedelta(minutes=11)
         assert orchestrator._is_decision_timed_out(pipeline) is True
 
+    def test_timed_out_in_init_phase(self, orchestrator):
+        pipeline, _ = orchestrator.create_pipeline("test")
+        pipeline.phase = PipelinePhase.INIT.value
+        pipeline.last_decision_at = datetime.now() - timedelta(minutes=31)
+        assert orchestrator._is_decision_timed_out(pipeline) is True
+
+    def test_not_timed_out_in_init_within_deadline(self, orchestrator):
+        pipeline, _ = orchestrator.create_pipeline("test")
+        pipeline.phase = PipelinePhase.INIT.value
+        pipeline.last_decision_at = datetime.now() - timedelta(minutes=5)
+        assert orchestrator._is_decision_timed_out(pipeline) is False
+
 
 class TestMarkDecisionPending:
     def test_sets_last_decision_at(self, orchestrator):
@@ -154,6 +166,16 @@ class TestAutoResolveDecision:
         orchestrator._auto_resolve_decision(pipeline)
         assert pipeline.last_decision_at is None
 
+    def test_init_defaults_to_A(self, orchestrator):
+        pipeline, _ = orchestrator.create_pipeline("ambiguous requirement")
+        pipeline.phase = PipelinePhase.INIT.value
+        orchestrator._mark_decision_pending(pipeline)
+        orchestrator._save_pipelines()
+
+        result = orchestrator._auto_resolve_decision(pipeline)
+        assert "action" in result
+        assert pipeline.last_decision_at is None
+
 
 class TestDecisionTimeoutIntegration:
     def test_advance_auto_resolves_on_timeout(self, orchestrator):
@@ -185,6 +207,39 @@ class TestDecisionTimeoutIntegration:
         )
         # Should proceed normally, not auto-resolve
         assert "error" not in result or result.get("action") != "auto_resolved"
+
+
+class TestPausedHandler:
+    def test_paused_decision_A_resumes_pipeline(self, orchestrator):
+        pipeline, _ = orchestrator.create_pipeline("paused flow")
+        pipeline.phase = PipelinePhase.PAUSED.value
+        pipeline.state = PipelineState.PAUSED.value
+        orchestrator._save_pipelines()
+
+        result = orchestrator.advance(pipeline.id, {"decision": "A"})
+        assert result.get("action") == "execute_next_task"
+        assert orchestrator.pipelines[pipeline.id].state == PipelineState.RUNNING
+
+    def test_paused_decision_B_fails_pipeline(self, orchestrator):
+        pipeline, _ = orchestrator.create_pipeline("paused stop")
+        pipeline.phase = PipelinePhase.PAUSED.value
+        pipeline.state = PipelineState.PAUSED.value
+        orchestrator._save_pipelines()
+
+        result = orchestrator.advance(pipeline.id, {"decision": "B"})
+        assert result.get("action") == "failed"
+        assert orchestrator.pipelines[pipeline.id].state == PipelineState.FAILED
+
+    def test_paused_invalid_decision_reasks(self, orchestrator):
+        pipeline, _ = orchestrator.create_pipeline("paused invalid")
+        pipeline.phase = PipelinePhase.PAUSED.value
+        pipeline.state = PipelineState.PAUSED.value
+        orchestrator._save_pipelines()
+
+        result = orchestrator.advance(pipeline.id, {"decision": "X"})
+        assert result.get("action") == "human_decision"
+        assert result.get("phase") == "paused"
+        assert result.get("options") == ["A", "B"]
 
 
 if __name__ == "__main__":

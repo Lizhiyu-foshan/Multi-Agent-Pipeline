@@ -134,7 +134,8 @@ class PipelineWatchdog:
         if pipeline.state in ("completed", "failed", "idle"):
             return result
 
-        task_stats = self.orchestrator.scheduler.task_queue.get_statistics()
+        pipe_tasks = self.orchestrator.scheduler.task_queue.get_by_pipeline(pipeline_id)
+        task_stats = self._pipeline_task_stats(pipe_tasks)
         result.task_stats = task_stats
 
         if pipeline.started_at:
@@ -150,7 +151,6 @@ class PipelineWatchdog:
                 )
                 return result
 
-        pipe_tasks = self.orchestrator.scheduler.task_queue.get_by_pipeline(pipeline_id)
         stalled = []
         for task in pipe_tasks:
             if task.status == "processing" and task.started_at:
@@ -184,7 +184,40 @@ class PipelineWatchdog:
                         f"No task completion in {no_progress_seconds:.0f}s"
                     )
 
+        self._check_session_idle(pipeline_id, result)
+
         return result
+
+    def _pipeline_task_stats(self, pipe_tasks: List[Any]) -> Dict[str, int]:
+        stats = {"pending": 0, "processing": 0, "completed": 0, "failed": 0}
+        for t in pipe_tasks:
+            stats[t.status] = stats.get(t.status, 0) + 1
+        stats["total"] = len(pipe_tasks)
+        return stats
+
+    def _check_session_idle(self, pipeline_id: str, result: HealthCheckResult):
+        if not self.orchestrator:
+            return
+        if not hasattr(self.orchestrator, "session_manager"):
+            return
+        sm = getattr(self.orchestrator, "session_manager", None)
+        if not sm or not hasattr(sm, "load_by_pipeline"):
+            return
+        try:
+            session = sm.load_by_pipeline(pipeline_id)
+        except Exception:
+            return
+        if not session or not getattr(session, "last_active_at", None):
+            return
+
+        idle_seconds = (datetime.now() - session.last_active_at).total_seconds()
+        if idle_seconds > self.config.session_idle_threshold_seconds:
+            if result.status == HealthStatus.HEALTHY:
+                result.status = HealthStatus.WARNING
+            result.issues.append(
+                f"Active model session idle for {idle_seconds:.0f}s "
+                f"(threshold: {self.config.session_idle_threshold_seconds:.0f}s)"
+            )
 
     def check_all(self) -> List[HealthCheckResult]:
         """Check health of all registered pipelines."""
