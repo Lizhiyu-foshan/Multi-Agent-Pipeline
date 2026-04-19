@@ -40,3 +40,6 @@ Thumbs.db
 .hashline_backups/
 *.tmp
 *.bak
+
+*.log
+*.log.*
