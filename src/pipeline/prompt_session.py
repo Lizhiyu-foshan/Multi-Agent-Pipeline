@@ -123,9 +123,9 @@ class PromptPassingSession:
 
     @property
     def is_dead(self) -> bool:
-        if not self.last_active_at:
+        if not self.created_at:
             return True
-        elapsed = (datetime.now() - self.last_active_at).total_seconds()
+        elapsed = (datetime.now() - self.created_at).total_seconds()
         return elapsed > SESSION_MAX_LIVE_SECONDS
 
     @property
@@ -284,8 +284,8 @@ class SessionManager:
                         self._pipeline_sessions[session.pipeline_id] = (
                             session.session_id
                         )
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"Failed to load session file {fp}: {e}")
 
 
 def create_session_from_pending(

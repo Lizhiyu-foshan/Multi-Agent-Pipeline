@@ -30,7 +30,7 @@ def orchestrator(temp_dir):
         def execute(self, description, context):
             return {"success": True, "artifacts": {"test": "data"}}
 
-    return PipelineOrchestrator(
+    orch = PipelineOrchestrator(
         state_dir=temp_dir,
         skills={
             "bmad-evo": MockSkill(),
@@ -39,6 +39,9 @@ def orchestrator(temp_dir):
         },
         watchdog_config=False,
     )
+    orch._auto_continue = False
+    orch._default_decision_timeout_seconds = 1800.0
+    return orch
 
 
 class TestIsDecisionTimedOut:

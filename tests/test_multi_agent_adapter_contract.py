@@ -22,6 +22,13 @@ class _FakeOrchestrator:
     def advance(self, pipeline_id, phase_result):
         return dict(self._result)
 
+    def retry_model_request(self, session_id, reason="timeout"):
+        return {
+            "action": "model_request",
+            "session_id": session_id,
+            "retry": {"count": 1, "max": 5, "reason": reason},
+        }
+
 
 def test_advance_keeps_failure_semantics():
     MultiAgentPipeline_Adapter = _load_adapter_class()
@@ -64,5 +71,28 @@ def test_advance_marks_success_when_no_error():
 
         assert result.get("success") is True
         assert result.get("action") == "execute_next_task"
+    finally:
+        shutil.rmtree(td, ignore_errors=True)
+
+
+def test_retry_model_request_action_works():
+    MultiAgentPipeline_Adapter = _load_adapter_class()
+    td = tempfile.mkdtemp()
+    try:
+        adapter = MultiAgentPipeline_Adapter(state_dir=td, skills={})
+        adapter._orchestrator = _FakeOrchestrator({"action": "noop"})
+
+        result = adapter.execute(
+            "",
+            {
+                "action": "retry_model_request",
+                "session_id": "sess_123",
+                "reason": "rate_limit",
+            },
+        )
+
+        assert result.get("success") is True
+        assert result.get("action") == "model_request"
+        assert result.get("retry", {}).get("reason") == "rate_limit"
     finally:
         shutil.rmtree(td, ignore_errors=True)

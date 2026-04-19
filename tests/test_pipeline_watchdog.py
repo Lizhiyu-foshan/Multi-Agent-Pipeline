@@ -93,8 +93,9 @@ class MockSessionManager:
 
 
 class MockSession:
-    def __init__(self, last_active_at):
+    def __init__(self, last_active_at, session_id="sess_test"):
         self.last_active_at = last_active_at
+        self.session_id = session_id
 
 
 class MockTaskQueue:
@@ -260,6 +261,21 @@ class TestHealthCheck:
         assert health.status in (HealthStatus.WARNING, HealthStatus.STALLED)
         assert any("session idle" in i.lower() for i in health.issues)
 
+    def test_check_warns_when_no_progress_since_registration(self):
+        orch = MockOrchestrator()
+        orch.add_pipeline("pipe_1")
+        orch.scheduler.add_task("t1", "pipe_1", status="pending")
+
+        config = WatchdogConfig(progress_stall_threshold_seconds=1)
+        wd = PipelineWatchdog(orchestrator=orch, config=config)
+        wd.register_pipeline("pipe_1")
+
+        wd._last_progress_time["pipe_1"] = datetime.now() - timedelta(seconds=5)
+        health = wd.check("pipe_1")
+
+        assert health.status in (HealthStatus.WARNING, HealthStatus.STALLED)
+        assert any("no task completion" in i.lower() for i in health.issues)
+
 
 class TestTakeAction:
     """Tests for PipelineWatchdog.take_action() method."""
@@ -368,6 +384,70 @@ class TestTakeAction:
 
         assert not any("auto_recovered" in a for a in action["actions"])
 
+    def test_take_action_auto_retries_idle_model_request(self):
+        orch = MockOrchestrator()
+        orch.add_pipeline("pipe_1")
+        orch.retry_calls = []
+
+        def _retry_model_request(session_id, reason="timeout"):
+            orch.retry_calls.append((session_id, reason))
+            return {"action": "model_request", "session_id": session_id}
+
+        orch.retry_model_request = _retry_model_request
+
+        config = WatchdogConfig(
+            auto_retry_idle_model_request=True,
+            model_request_retry_max_attempts=3,
+            model_request_retry_cooldown_seconds=0,
+            session_idle_threshold_seconds=1,
+        )
+        wd = PipelineWatchdog(orchestrator=orch, config=config)
+
+        health = HealthCheckResult(
+            pipeline_id="pipe_1",
+            status=HealthStatus.WARNING,
+            issues=["Active model session idle"],
+        )
+        health.active_session_id = "sess_1"
+        health.session_idle_seconds = 500
+
+        action = wd.take_action(health)
+
+        assert any(
+            "retry_model_request:sess_1:attempt_1" in a for a in action["actions"]
+        )
+        assert len(orch.retry_calls) == 1
+        assert orch.retry_calls[0] == ("sess_1", "watchdog_session_idle")
+
+    def test_take_action_respects_idle_model_retry_limits(self):
+        orch = MockOrchestrator()
+        orch.add_pipeline("pipe_1")
+        orch.retry_calls = []
+
+        def _retry_model_request(session_id, reason="timeout"):
+            orch.retry_calls.append((session_id, reason))
+            return {"action": "model_request", "session_id": session_id}
+
+        orch.retry_model_request = _retry_model_request
+
+        config = WatchdogConfig(
+            auto_retry_idle_model_request=True,
+            model_request_retry_max_attempts=2,
+            model_request_retry_cooldown_seconds=0,
+        )
+        wd = PipelineWatchdog(orchestrator=orch, config=config)
+
+        health = HealthCheckResult(pipeline_id="pipe_1", status=HealthStatus.WARNING)
+        health.active_session_id = "sess_limit"
+        health.session_idle_seconds = 2000
+
+        wd.take_action(health)
+        wd.take_action(health)
+        action = wd.take_action(health)
+
+        assert len(orch.retry_calls) == 2
+        assert not any("attempt_3" in a for a in action["actions"])
+
 
 class TestCheckAll:
     """Tests for PipelineWatchdog.check_all() method."""
@@ -474,6 +554,23 @@ class TestGetStatus:
 
         assert status["config"]["check_interval"] == 45.0
         assert status["config"]["auto_recover"] is True
+
+    def test_get_status_includes_model_retry_fields(self):
+        orch = MockOrchestrator()
+        wd = PipelineWatchdog(
+            orchestrator=orch,
+            config=WatchdogConfig(
+                auto_retry_idle_model_request=True,
+                model_request_retry_max_attempts=4,
+                model_request_retry_cooldown_seconds=90.0,
+            ),
+        )
+        status = wd.get_status()
+
+        assert status["config"]["auto_retry_idle_model_request"] is True
+        assert status["config"]["model_request_retry_max_attempts"] == 4
+        assert status["config"]["model_request_retry_cooldown_seconds"] == 90.0
+        assert "model_retry_attempts" in status
 
 
 # Helper class for testing

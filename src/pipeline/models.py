@@ -5,7 +5,7 @@ Adapted from the reference implementation with:
 - Windows compatibility (no fcntl)
 - Dynamic roles (from bmad-evo analysis, not predefined)
 - Prompt-passing protocol (no external AI calls)
-- Long-running pipeline support (3-5 hours)
+- Long-running pipeline support (up to 8 hours)
 """
 
 import json
@@ -350,6 +350,8 @@ class PipelineRun:
     decision_timeout_seconds: float = 1800.0
     last_decision_at: Optional[datetime] = None
     phase_history: List[Dict[str, Any]] = field(default_factory=list)
+    backlog: List[Dict[str, Any]] = field(default_factory=list)
+    pdca_max_cycles: int = 20
 
     def __post_init__(self):
         if not self.id:
@@ -407,6 +409,8 @@ class PipelineRun:
             if self.last_decision_at
             else None,
             "phase_history": self.phase_history,
+            "backlog": self.backlog,
+            "pdca_max_cycles": self.pdca_max_cycles,
         }
 
     @classmethod
@@ -421,11 +425,13 @@ class PipelineRun:
             artifacts=data.get("artifacts", {}),
             decision_history=data.get("decision_history", []),
             pdca_cycle=data.get("pdca_cycle", 0),
-            max_duration_hours=data.get("max_duration_hours", 5.0),
+            max_duration_hours=data.get("max_duration_hours", 8.0),
             recovery_count=data.get("recovery_count", 0),
             last_checkpoint_id=data.get("last_checkpoint_id", ""),
             decision_timeout_seconds=data.get("decision_timeout_seconds", 1800.0),
             phase_history=data.get("phase_history", []),
+            backlog=data.get("backlog", []),
+            pdca_max_cycles=data.get("pdca_max_cycles", 20),
         )
         if data.get("created_at"):
             p.created_at = datetime.fromisoformat(data["created_at"])

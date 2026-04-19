@@ -43,6 +43,10 @@ class WatchdogConfig:
     auto_recover: bool = False
     max_auto_recover_attempts: int = 2
     auto_retry_stalled_tasks: bool = False
+    auto_retry_idle_model_request: bool = False
+    model_request_retry_max_attempts: int = 3
+    model_request_retry_cooldown_seconds: float = 120.0
+    model_request_retry_reason: str = "watchdog_session_idle"
     on_stall_callback: Optional[Callable] = None
     on_timeout_callback: Optional[Callable] = None
 
@@ -55,6 +59,8 @@ class HealthCheckResult:
     stalled_tasks: List[str] = field(default_factory=list)
     elapsed_seconds: float = 0.0
     task_stats: Dict[str, int] = field(default_factory=dict)
+    active_session_id: str = ""
+    session_idle_seconds: float = 0.0
     checked_at: Optional[datetime] = None
 
     def __post_init__(self):
@@ -88,6 +94,8 @@ class PipelineWatchdog:
         self._monitor_thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
         self._recovery_attempts: Dict[str, int] = {}
+        self._model_retry_attempts: Dict[str, int] = {}
+        self._last_model_retry_at: Dict[str, datetime] = {}
         self._last_progress_time: Dict[str, datetime] = {}
         self._last_completed_counts: Dict[str, int] = {}
         self._monitored_pipelines: set = set()
@@ -102,10 +110,16 @@ class PipelineWatchdog:
 
     def register_pipeline(self, pipeline_id: str):
         self._monitored_pipelines.add(pipeline_id)
+        if pipeline_id not in self._last_progress_time:
+            self._last_progress_time[pipeline_id] = datetime.now()
+        if pipeline_id not in self._last_completed_counts:
+            self._last_completed_counts[pipeline_id] = 0
 
     def unregister_pipeline(self, pipeline_id: str):
         self._monitored_pipelines.discard(pipeline_id)
         self._recovery_attempts.pop(pipeline_id, None)
+        self._model_retry_attempts.pop(pipeline_id, None)
+        self._last_model_retry_at.pop(pipeline_id, None)
         self._last_progress_time.pop(pipeline_id, None)
         self._last_completed_counts.pop(pipeline_id, None)
 
@@ -170,6 +184,12 @@ class PipelineWatchdog:
         prev_count = self._last_completed_counts.get(pipeline_id, 0)
         now = datetime.now()
 
+        if pipeline_id not in self._last_progress_time:
+            self._last_progress_time[pipeline_id] = now
+        if pipeline_id not in self._last_completed_counts:
+            self._last_completed_counts[pipeline_id] = completed_count
+            prev_count = completed_count
+
         if completed_count > prev_count:
             self._last_progress_time[pipeline_id] = now
             self._last_completed_counts[pipeline_id] = completed_count
@@ -211,6 +231,8 @@ class PipelineWatchdog:
             return
 
         idle_seconds = (datetime.now() - session.last_active_at).total_seconds()
+        result.active_session_id = getattr(session, "session_id", "")
+        result.session_idle_seconds = idle_seconds
         if idle_seconds > self.config.session_idle_threshold_seconds:
             if result.status == HealthStatus.HEALTHY:
                 result.status = HealthStatus.WARNING
@@ -266,6 +288,50 @@ class PipelineWatchdog:
                     actions_taken.append("stall_callback_executed")
                 except Exception as e:
                     logger.error(f"Stall callback failed: {e}")
+
+        if (
+            self.config.auto_retry_idle_model_request
+            and self.orchestrator
+            and health.status in (HealthStatus.WARNING, HealthStatus.STALLED)
+            and health.active_session_id
+            and hasattr(self.orchestrator, "retry_model_request")
+        ):
+            attempts = self._model_retry_attempts.get(health.pipeline_id, 0)
+            last_retry = self._last_model_retry_at.get(health.pipeline_id)
+            cooldown_ok = (
+                last_retry is None
+                or (datetime.now() - last_retry).total_seconds()
+                >= self.config.model_request_retry_cooldown_seconds
+            )
+
+            if attempts < self.config.model_request_retry_max_attempts and cooldown_ok:
+                try:
+                    retry_result = self.orchestrator.retry_model_request(
+                        health.active_session_id,
+                        reason=self.config.model_request_retry_reason,
+                    )
+                    action = retry_result.get("action")
+                    if action == "model_request":
+                        attempts += 1
+                        self._model_retry_attempts[health.pipeline_id] = attempts
+                        self._last_model_retry_at[health.pipeline_id] = datetime.now()
+                        actions_taken.append(
+                            f"retry_model_request:{health.active_session_id}:attempt_{attempts}"
+                        )
+                    elif action == "model_request_retry_exhausted":
+                        self._model_retry_attempts[health.pipeline_id] = (
+                            self.config.model_request_retry_max_attempts
+                        )
+                        actions_taken.append(
+                            f"retry_model_request_exhausted:{health.active_session_id}"
+                        )
+                    elif retry_result.get("error"):
+                        actions_taken.append(
+                            f"retry_model_request_failed:{retry_result.get('error')}"
+                        )
+                except Exception as e:
+                    logger.error(f"Idle model request retry failed: {e}")
+                    actions_taken.append("retry_model_request_exception")
 
         if self.config.auto_recover and self.orchestrator:
             attempts = self._recovery_attempts.get(health.pipeline_id, 0)
@@ -344,6 +410,10 @@ class PipelineWatchdog:
                 "task_stall_threshold": self.config.task_stall_threshold_seconds,
                 "auto_recover": self.config.auto_recover,
                 "max_auto_recover_attempts": self.config.max_auto_recover_attempts,
+                "auto_retry_idle_model_request": self.config.auto_retry_idle_model_request,
+                "model_request_retry_max_attempts": self.config.model_request_retry_max_attempts,
+                "model_request_retry_cooldown_seconds": self.config.model_request_retry_cooldown_seconds,
             },
             "recovery_attempts": dict(self._recovery_attempts),
+            "model_retry_attempts": dict(self._model_retry_attempts),
         }

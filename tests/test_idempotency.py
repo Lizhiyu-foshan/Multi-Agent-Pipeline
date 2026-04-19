@@ -30,7 +30,7 @@ def temp_dir():
 
 @pytest.fixture
 def orch(temp_dir):
-    return PipelineOrchestrator(
+    o = PipelineOrchestrator(
         state_dir=temp_dir,
         skills={
             "bmad-evo": MockSkill(),
@@ -39,6 +39,9 @@ def orch(temp_dir):
         },
         watchdog_config=False,
     )
+    o._auto_continue = False
+    o._default_decision_timeout_seconds = 1800.0
+    return o
 
 
 class TestIdempotencyKey:

@@ -1,6 +1,7 @@
 import shutil
 import tempfile
 import threading
+from datetime import datetime, timedelta
 from pathlib import Path
 import sys
 
@@ -56,3 +57,10 @@ def test_session_manager_thread_safety(temp_dir):
         t.join()
 
     assert len(errors) == 0
+
+
+def test_session_is_dead_uses_created_at_hard_cap():
+    sess = PromptPassingSession(pipeline_id="pipe_1", task_id="task_1", skill_name="s")
+    sess.created_at = datetime.now() - timedelta(days=2)
+    sess.last_active_at = datetime.now()
+    assert sess.is_dead is True

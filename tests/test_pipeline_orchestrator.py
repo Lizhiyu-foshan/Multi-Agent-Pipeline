@@ -15,6 +15,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 from datetime import datetime, timedelta
 from pipeline.pipeline_orchestrator import PipelineOrchestrator
 from pipeline.models import PipelineRun, PipelineState, PipelinePhase, Task
+from pipeline.prompt_session import create_session_from_pending
+from pipeline.execution_evaluator import EvaluationResult
 
 
 @pytest.fixture
@@ -33,7 +35,10 @@ def orchestrator(temp_dir):
         "superpowers": MockSkill(),
         "spec-kit": MockSkill(),
     }
-    return PipelineOrchestrator(state_dir=temp_dir, skills=skills)
+    orch = PipelineOrchestrator(state_dir=temp_dir, skills=skills)
+    orch._auto_continue = False
+    orch._default_decision_timeout_seconds = 1800.0
+    return orch
 
 
 class MockSkill:
@@ -200,6 +205,97 @@ class TestRecoverBasic:
         assert "not recoverable" in result["error"].lower()
 
 
+class TestDefaultsAndModelRequestRetry:
+    def test_create_pipeline_default_max_duration_is_8h(self, orchestrator):
+        pipeline, _ = orchestrator.create_pipeline("Default duration check")
+        assert pipeline.max_duration_hours == 5.0
+
+    def test_retry_model_request_reissues_prompt(self, orchestrator):
+        session = create_session_from_pending(
+            pending_request={"type": "chat", "prompt": "please continue"},
+            pipeline_id="pipe_x",
+            task_id="task_x",
+            skill_name="superpowers",
+            action="execute_task",
+            phase="execute",
+            context={"model_route": {"category": "standard"}},
+            max_rounds=5,
+        )
+
+        pipeline = PipelineRun(
+            id="pipe_x",
+            description="Retry model request",
+            state=PipelineState.RUNNING,
+            phase=PipelinePhase.EXECUTE,
+        )
+        orchestrator.pipelines[pipeline.id] = pipeline
+        orchestrator._save_pipelines()
+
+        sid = orchestrator.session_manager.save(session)
+        result = orchestrator.retry_model_request(sid, reason="rate_limit")
+
+        assert result.get("action") == "model_request"
+        assert result.get("session_id") == sid
+        assert result.get("prompt") == "please continue"
+        assert result.get("retry", {}).get("count") == 1
+        assert result.get("retry", {}).get("reason") == "rate_limit"
+
+    def test_retry_model_request_exhausted(self, orchestrator):
+        session = create_session_from_pending(
+            pending_request={"type": "chat", "prompt": "retry me"},
+            pipeline_id="pipe_y",
+            task_id="task_y",
+            skill_name="superpowers",
+            action="execute_task",
+            phase="execute",
+            context={"_model_retry_count": 5, "_model_retry_max": 5},
+            max_rounds=5,
+        )
+
+        pipeline = PipelineRun(
+            id="pipe_y",
+            description="Retry exhausted",
+            state=PipelineState.RUNNING,
+            phase=PipelinePhase.EXECUTE,
+        )
+        orchestrator.pipelines[pipeline.id] = pipeline
+        orchestrator._save_pipelines()
+
+        sid = orchestrator.session_manager.save(session)
+        result = orchestrator.retry_model_request(sid, reason="timeout")
+
+        assert result.get("action") == "model_request_retry_exhausted"
+        assert result.get("retry_count") == 5
+        assert result.get("retry_max") == 5
+
+    def test_config_file_override_via_env(self, temp_dir, monkeypatch):
+        cfg_path = os.path.join(temp_dir, "map_custom.json")
+        with open(cfg_path, "w", encoding="utf-8") as f:
+            f.write(
+                '{"pipeline":{"default_max_duration_hours":9.0,"decision_timeout_seconds":900},'
+                '"model_request_retry":{"max_retries":7,"base_delay_seconds":3,"max_delay_seconds":33},'
+                '"watchdog":{"enabled":false}}'
+            )
+
+        monkeypatch.setenv("MAP_CONFIG_PATH", cfg_path)
+        orch = PipelineOrchestrator(
+            state_dir=temp_dir,
+            skills={
+                "bmad-evo": MockSkill(),
+                "superpowers": MockSkill(),
+                "spec-kit": MockSkill(),
+            },
+        )
+
+        pipeline, _ = orch.create_pipeline("Config override check")
+        assert pipeline.max_duration_hours == 9.0
+        assert pipeline.decision_timeout_seconds == 900
+        assert orch._model_request_retry_max == 7
+        assert orch._model_request_retry_base_seconds == 3
+        assert orch._model_request_retry_max_seconds == 33
+        assert orch.watchdog is None
+
+
 class TestRecoverTasksFromSnapshot:
     """Tests for _recover_tasks_from_snapshot() method."""
 
@@ -290,6 +386,54 @@ class TestRecoverTasksFromSnapshot:
         assert task is not None
         assert task.status == "pending"
 
+    def test_recover_tasks_replaces_existing_task_fields(self, orchestrator):
+        pipeline = PipelineRun(id="pipe_restore", description="Restore fields")
+        orchestrator.pipelines[pipeline.id] = pipeline
+        orchestrator._save_pipelines()
+
+        orchestrator.scheduler.registry.register("developer", "Dev", ["code"])
+
+        task_result = orchestrator.scheduler.submit_task(
+            {
+                "pipeline_id": pipeline.id,
+                "role_id": "developer",
+                "name": "Task restore",
+                "description": "old",
+                "priority": "P2",
+                "depends_on": [],
+            }
+        )
+        tid = task_result["task_id"]
+        task = orchestrator.scheduler.task_queue.get(tid)
+        task.retry_count = 0
+        task.depends_on = []
+        orchestrator.scheduler.task_queue._save()
+
+        snapshot = {
+            "tasks": [
+                {
+                    "id": tid,
+                    "pipeline_id": pipeline.id,
+                    "role_id": "developer",
+                    "name": "Task restore",
+                    "description": "restored",
+                    "priority": "P1",
+                    "depends_on": ["dep_1"],
+                    "status": "processing",
+                    "retry_count": 2,
+                    "max_retries": 5,
+                    "result": {"progress": "half"},
+                }
+            ]
+        }
+
+        orchestrator._recover_tasks_from_snapshot(pipeline, snapshot)
+        restored = orchestrator.scheduler.task_queue.get(tid)
+        assert restored.status == "processing"
+        assert restored.retry_count == 2
+        assert restored.depends_on == ["dep_1"]
+        assert restored.priority == "P1"
+
 
 class TestRecoverResetTasks:
     """Tests for _recover_reset_tasks() method."""
@@ -337,6 +481,70 @@ class TestRecoverResetTasks:
         assert task2.status == "pending"
         assert task1.retry_count == 1
         assert task2.retry_count == 1
+
+
+class TestParallelLoopDepth:
+    def test_parallel_path_runs_multiple_loop_iterations(self, orchestrator):
+        class MultiIterSkill:
+            def __init__(self):
+                self.calls = 0
+
+            def execute(self, prompt, context):
+                self.calls += 1
+                return {
+                    "success": True,
+                    "output": f"attempt {self.calls}",
+                    "artifacts": {"attempt": self.calls},
+                }
+
+        class TwoStepEvaluator:
+            def __init__(self):
+                self.calls = 0
+
+            def evaluate(self, **kwargs):
+                self.calls += 1
+                passed = self.calls >= 2
+                score = 0.7 if passed else 0.2
+                return EvaluationResult(
+                    passed=passed,
+                    score=score,
+                    issues=[] if passed else ["needs refinement"],
+                    suggestions=[] if passed else ["improve"],
+                )
+
+        orchestrator.skills["superpowers"] = MultiIterSkill()
+        orchestrator.evaluator = TwoStepEvaluator()
+
+        pipeline, _ = orchestrator.create_pipeline("parallel loop")
+        pipeline.phase = PipelinePhase.EXECUTE.value
+        pipeline.state = PipelineState.RUNNING
+        orchestrator.scheduler.registry.register("developer", "Dev", ["code"])
+        t = orchestrator.scheduler.submit_task(
+            {
+                "pipeline_id": pipeline.id,
+                "role_id": "developer",
+                "name": "Task",
+                "description": "Do work",
+                "priority": "P1",
+                "depends_on": [],
+            }
+        )
+        task_id = t["task_id"]
+        pipeline.tasks = [task_id]
+        orchestrator._save_pipelines()
+
+        result = orchestrator._execute_skill_for_parallel(
+            {
+                "task_id": task_id,
+                "skill": "superpowers",
+                "role_id": "developer",
+                "prompt": "Build feature",
+            },
+            pipeline,
+        )
+
+        assert result.get("success") is True
+        assert orchestrator.skills["superpowers"].calls == 2
 
     def test_recover_reset_respects_max_retries(self, orchestrator):
         """Should not reset tasks that exceeded max_retries."""
