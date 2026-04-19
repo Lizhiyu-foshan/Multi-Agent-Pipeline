@@ -500,10 +500,18 @@ class AgentLoop:
             need another skill execution.
         """
         pending = state.context.get("pending_model_request", {})
+        artifacts = pending.get("artifacts", {})
+        if not artifacts:
+            try:
+                parsed = json.loads(model_response)
+                if isinstance(parsed, dict) and parsed.get("artifacts"):
+                    artifacts = parsed["artifacts"]
+            except (json.JSONDecodeError, ValueError):
+                pass
         synthetic_result = {
             "success": True,
             "output": model_response,
-            "artifacts": pending.get("artifacts", {}),
+            "artifacts": artifacts,
         }
 
         state.needs_model = False

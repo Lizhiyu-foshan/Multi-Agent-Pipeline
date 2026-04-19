@@ -11,13 +11,27 @@ cd D:\Multi-Agent-Pipeline
 pip install -r requirements.txt
 ```
 
-### 2. Run Tests
+### 2. Run Regression Baseline
+
+```bash
+python scripts/run_regression_baseline.py
+```
+
+This is the fixed regression baseline to run after every change.
+It executes the stable pytest suite and excludes script-style E2E files:
+
+```bash
+python -m pytest tests -q --ignore=tests/test_e2e.py --ignore=tests/test_real_adapter_e2e.py
+```
+
+### 3. Optional Full E2E (slower)
 
 ```bash
 python tests/test_e2e.py
+python tests/test_real_adapter_e2e.py
 ```
 
-### 3. Usage
+### 4. Usage
 
 ```python
 from pipeline import PipelineOrchestrator
