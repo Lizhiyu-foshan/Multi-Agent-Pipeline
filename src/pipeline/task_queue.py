@@ -136,12 +136,12 @@ class TaskQueue:
                 logger.warning(f"Task {task_id} not found for status update")
                 return
             task.status = status
+            if result:
+                task.result = result
             if status == "processing":
                 task.started_at = datetime.now()
             elif status in ("completed", "failed"):
                 task.completed_at = datetime.now()
-                if result:
-                    task.result = result
                 if status == "failed":
                     error_msg = ""
                     if result and isinstance(result, dict):
@@ -302,3 +302,7 @@ class TaskQueue:
                 self._save()
                 return True
             return False
+
+    def persist(self):
+        """Persist current task queue state to disk."""
+        self._save()

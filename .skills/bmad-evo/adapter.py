@@ -1,17 +1,24 @@
 """
 BMAD-EVO Skill Adapter
+Design Architect & Project Planner for Multi-Agent Pipeline.
 
 Wraps the real bmad-evo framework (D:/bmad-evo) without modifying it.
 References original code via sys.path.
-Uses PromptManager for report formatting templates.
+
+Role: Project designer/architect responsible for:
+- Overall project design, construction plan, task decomposition, role assignment
+- Post-PDCA cycle evaluation and project document updates
+- Requirement refinement into structured design docs and development plans
 
 Actions:
-- analyze: Task type detection + complexity assessment via TaskAnalyzer
+- analyze: Requirement analysis → structured design document with roles + tasks
+- plan: Create execution plan with task_graph, dependencies, execution waves
 - deep_analysis: Full multi-agent workflow via WorkflowOrchestratorV3Final
 - clarify: Multi-round requirement clarification
 - generate_constraints: Produce constraint rules from analysis (for spec-kit)
 - spec_evolution: Analyze existing specs and suggest improvements
 - update_for_feedback: Handle new user story / bug, update analysis
+- eval_and_update: Post-PDCA evaluation → update project docs and task list
 """
 
 import sys
@@ -64,18 +71,6 @@ def _get_bridge(project_path: Path):
         logger.warning(f"ModelBridge init failed: {e}")
         _bridge = None
     return _bridge
-    try:
-        from model_bridge import ModelBridge, load_bmad_env_config, patch_bmad_modules
-
-        env_mode = load_bmad_env_config(project_path)
-        _bridge = ModelBridge(mode=env_mode)
-        patched = patch_bmad_modules(_bridge)
-        if patched:
-            logger.info(f"BMAD modules patched with mode: {_bridge.mode}")
-    except Exception as e:
-        logger.warning(f"ModelBridge init failed: {e}")
-        _bridge = None
-    return _bridge
 
 
 class Bmad_Evo_Adapter:
@@ -95,11 +90,13 @@ class Bmad_Evo_Adapter:
         action = context.get("action", "analyze")
         handlers = {
             "analyze": self._handle_analyze,
+            "plan": self._handle_plan,
             "deep_analysis": self._handle_deep_analysis,
             "clarify": self._handle_clarify,
             "generate_constraints": self._handle_generate_constraints,
             "spec_evolution": self._handle_spec_evolution,
             "update_for_feedback": self._handle_update_for_feedback,
+            "eval_and_update": self._handle_eval_and_update,
         }
         handler = handlers.get(action, self._handle_analyze)
         return handler(task_description, context)
@@ -153,19 +150,28 @@ class Bmad_Evo_Adapter:
 
             enriched = self._enrich_with_spec(analysis.to_dict(), spec_context)
 
+            artifacts = {
+                "analysis_report": self._format_analysis_report(
+                    enriched, task_description
+                ),
+                "task_type": enriched.get("task_type", "unknown"),
+                "complexity_score": enriched.get("complexity_score", 0),
+                "recommended_roles": enriched.get("recommended_roles_count", 0),
+                "risk_factors": enriched.get("risk_factors", []),
+                "success_criteria": enriched.get("success_criteria", []),
+                "spec_alignment": enriched.get("spec_alignment", ""),
+            }
+
+            parsed_roles = enriched.get("roles", [])
+            parsed_tasks = enriched.get("tasks", [])
+            if parsed_roles:
+                artifacts["roles"] = parsed_roles
+            if parsed_tasks:
+                artifacts["tasks"] = parsed_tasks
+
             return {
                 "success": True,
-                "artifacts": {
-                    "analysis_report": self._format_analysis_report(
-                        enriched, task_description
-                    ),
-                    "task_type": enriched.get("task_type", "unknown"),
-                    "complexity_score": enriched.get("complexity_score", 0),
-                    "recommended_roles": enriched.get("recommended_roles_count", 0),
-                    "risk_factors": enriched.get("risk_factors", []),
-                    "success_criteria": enriched.get("success_criteria", []),
-                    "spec_alignment": enriched.get("spec_alignment", ""),
-                },
+                "artifacts": artifacts,
             }
         except Exception as e:
             if ModelRequestPending and isinstance(e, ModelRequestPending):
@@ -211,20 +217,35 @@ class Bmad_Evo_Adapter:
 
         enriched = self._enrich_with_spec(analysis, spec_context)
 
+        roles = data.get("roles", [])
+        if not roles and isinstance(data.get("recommended_roles"), list):
+            roles = data["recommended_roles"]
+
+        tasks = data.get("tasks", [])
+        if not tasks and isinstance(data.get("task_breakdown"), list):
+            tasks = data["task_breakdown"]
+
+        artifacts = {
+            "analysis_report": self._format_analysis_report(
+                enriched, task_description
+            ),
+            "task_type": enriched.get("task_type", "unknown"),
+            "complexity_score": enriched.get("complexity_score", 0),
+            "recommended_roles": enriched.get("recommended_roles_count", 0),
+            "risk_factors": enriched.get("risk_factors", []),
+            "success_criteria": enriched.get("success_criteria", []),
+            "spec_alignment": enriched.get("spec_alignment", ""),
+            "model_response_used": True,
+        }
+
+        if roles:
+            artifacts["roles"] = roles
+        if tasks:
+            artifacts["tasks"] = tasks
+
         return {
             "success": True,
-            "artifacts": {
-                "analysis_report": self._format_analysis_report(
-                    enriched, task_description
-                ),
-                "task_type": enriched.get("task_type", "unknown"),
-                "complexity_score": enriched.get("complexity_score", 0),
-                "recommended_roles": enriched.get("recommended_roles_count", 0),
-                "risk_factors": enriched.get("risk_factors", []),
-                "success_criteria": enriched.get("success_criteria", []),
-                "spec_alignment": enriched.get("spec_alignment", ""),
-                "model_response_used": True,
-            },
+            "artifacts": artifacts,
         }
 
     def _handle_deep_analysis(
@@ -261,6 +282,350 @@ class Bmad_Evo_Adapter:
         except Exception as e:
             logger.warning(f"BMAD deep analysis failed, using fallback: {e}")
             return self._fallback_analysis(task_description, spec_context)
+
+    def _handle_plan(
+        self, task_description: str, context: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """
+        Create structured execution plan with task_graph from analysis results.
+
+        Expects context to contain analysis artifacts (roles, tasks) from
+        the ANALYZE phase. Produces a task_graph with tasks, dependencies,
+        and execution waves for the orchestrator to submit.
+        """
+        spec_context = context.get("spec_context", "")
+        model_response = context.get("model_response")
+
+        if model_response and context.get("model_request_id"):
+            return self._continue_plan(model_response, task_description, context)
+
+        analysis_artifacts = context.get("previous_artifacts_summary", "")
+        if isinstance(analysis_artifacts, dict):
+            analysis_artifacts = str(analysis_artifacts)
+
+        roles_data = context.get("roles", [])
+        tasks_data = context.get("tasks", [])
+
+        if roles_data or tasks_data:
+            task_graph = self._build_task_graph(tasks_data, roles_data)
+            return {
+                "success": True,
+                "artifacts": {
+                    "task_graph": task_graph,
+                    "plan_report": self._format_plan_report(task_graph),
+                    "roles": roles_data,
+                    "total_tasks": len(task_graph.get("tasks", [])),
+                    "execution_waves": len(task_graph.get("execution_waves", [])),
+                },
+            }
+
+        plan_prompt = self._build_plan_prompt(
+            task_description, analysis_artifacts, roles_data, tasks_data
+        )
+
+        if not self._bmad_available:
+            return self._fallback_plan(task_description, plan_prompt)
+
+        try:
+            from task_analyzer import TaskAnalyzer
+            from model_bridge import ModelBridge
+
+            analyzer = TaskAnalyzer(timeout=120)
+            analyzer.analyze(plan_prompt)
+
+            if ModelBridge._pending_requests:
+                latest = ModelBridge._pending_requests[-1]
+                ModelBridge._pending_requests = []
+                pending_req = {
+                    "id": latest["id"],
+                    "type": "chat",
+                    "prompt": latest["prompt"],
+                    "model": latest["model"],
+                    "instructions": (
+                        "Generate a structured execution plan as JSON with "
+                        "task_graph containing tasks (each with name, description, "
+                        "role, dependencies, priority) and execution_waves."
+                    ),
+                }
+                return {
+                    "success": False,
+                    "pending_model_request": pending_req,
+                    "model_request": pending_req,
+                }
+        except Exception as e:
+            logger.warning(f"BMAD plan via model failed: {e}")
+
+        return self._fallback_plan(task_description, plan_prompt)
+
+    def _continue_plan(
+        self, model_response: str, task_description: str, context: Dict
+    ) -> Dict[str, Any]:
+        try:
+            import json as _json
+            data = _json.loads(model_response)
+        except Exception:
+            data = {}
+
+        task_graph = data.get("task_graph", {})
+        if not task_graph.get("tasks"):
+            raw_tasks = data.get("tasks", [])
+            roles = data.get("roles", [])
+            task_graph = self._build_task_graph(raw_tasks, roles)
+
+        return {
+            "success": True,
+            "artifacts": {
+                "task_graph": task_graph,
+                "plan_report": self._format_plan_report(task_graph),
+                "roles": data.get("roles", context.get("roles", [])),
+                "total_tasks": len(task_graph.get("tasks", [])),
+                "execution_waves": len(task_graph.get("execution_waves", [])),
+            },
+        }
+
+    def _build_task_graph(
+        self, tasks: List[Dict], roles: List[Dict]
+    ) -> Dict[str, Any]:
+        graph_tasks = []
+        for i, t in enumerate(tasks):
+            if isinstance(t, str):
+                t = {"name": t, "description": t}
+            graph_tasks.append({
+                "name": t.get("name", t.get("title", f"task_{i+1}")),
+                "description": t.get("description", t.get("name", "")),
+                "role": t.get("role", t.get("role_id", "developer")),
+                "priority": t.get("priority", "P2"),
+                "depends_on": t.get("depends_on", t.get("dependencies", [])),
+                "estimated_effort": t.get("estimated_effort", "medium"),
+            })
+
+        waves = self._compute_execution_waves(graph_tasks)
+        return {
+            "tasks": graph_tasks,
+            "execution_waves": waves,
+            "total": len(graph_tasks),
+        }
+
+    def _compute_execution_waves(self, tasks: List[Dict]) -> List[List[int]]:
+        task_names = {t["name"]: i for i, t in enumerate(tasks)}
+        remaining = set(range(len(tasks)))
+        waves = []
+
+        while remaining:
+            wave = []
+            for idx in sorted(remaining):
+                deps = tasks[idx].get("depends_on", [])
+                dep_indices = set()
+                for d in deps:
+                    if d in task_names:
+                        dep_indices.add(task_names[d])
+                if not dep_indices.intersection(remaining - {idx}):
+                    wave.append(idx)
+
+            if not wave:
+                wave = [min(remaining)]
+
+            waves.append(wave)
+            remaining -= set(wave)
+
+        return waves
+
+    def _build_plan_prompt(
+        self, description: str, analysis: str, roles: List, tasks: List
+    ) -> str:
+        parts = [
+            "Create detailed execution plan based on analysis.",
+            f"\nDescription: {description}",
+        ]
+        if analysis:
+            parts.append(f"\nAnalysis Summary: {str(analysis)[:1000]}")
+        if roles:
+            import json as _json
+            parts.append(f"\nRoles: {_json.dumps(roles, ensure_ascii=False)[:500]}")
+        if tasks:
+            import json as _json
+            parts.append(f"\nTasks: {_json.dumps(tasks, ensure_ascii=False)[:1000]}")
+        parts.append(
+            "\nOutput a JSON object with 'task_graph' containing 'tasks' "
+            "(list with name, description, role, priority, depends_on) "
+            "and 'execution_waves'."
+        )
+        return "\n".join(parts)
+
+    def _fallback_plan(self, description: str, prompt: str) -> Dict[str, Any]:
+        tasks = [
+            {"name": "verify_baseline", "description": "Verify existing tests pass",
+             "role": "developer", "priority": "P1", "depends_on": []},
+            {"name": "implement_core", "description": "Implement core features",
+             "role": "developer", "priority": "P1", "depends_on": ["verify_baseline"]},
+            {"name": "write_tests", "description": "Write integration tests",
+             "role": "developer", "priority": "P1", "depends_on": ["implement_core"]},
+            {"name": "quality_review", "description": "Quality review",
+             "role": "reviewer", "priority": "P2", "depends_on": ["write_tests"]},
+            {"name": "final_regression", "description": "Final regression test",
+             "role": "developer", "priority": "P1", "depends_on": ["quality_review"]},
+        ]
+        task_graph = self._build_task_graph(tasks, [])
+        return {
+            "success": True,
+            "artifacts": {
+                "task_graph": task_graph,
+                "plan_report": self._format_plan_report(task_graph),
+                "roles": [
+                    {"type": "developer", "name": "developer", "capabilities": ["code", "test"]},
+                    {"type": "reviewer", "name": "reviewer", "capabilities": ["review", "quality"]},
+                ],
+                "total_tasks": len(tasks),
+                "execution_waves": len(task_graph.get("execution_waves", [])),
+            },
+        }
+
+    def _format_plan_report(self, task_graph: Dict) -> str:
+        tasks = task_graph.get("tasks", [])
+        waves = task_graph.get("execution_waves", [])
+        lines = [
+            "# Execution Plan",
+            "",
+            f"Total tasks: {len(tasks)}",
+            f"Execution waves: {len(waves)}",
+            "",
+        ]
+        for wave_idx, wave in enumerate(waves, 1):
+            lines.append(f"## Wave {wave_idx}")
+            for task_idx in wave:
+                if task_idx < len(tasks):
+                    t = tasks[task_idx]
+                    lines.append(
+                        f"  - [{t.get('role', '?')}] {t.get('name', '?')} "
+                        f"(priority: {t.get('priority', 'P2')})"
+                    )
+            lines.append("")
+        return "\n".join(lines)
+
+    def _handle_eval_and_update(
+        self, task_description: str, context: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """
+        Post-PDCA cycle evaluation: assess completed work, identify issues,
+        update project documents, and generate new/modified tasks.
+
+        Context expects:
+        - pdca_cycle: current cycle number
+        - task_results: summary of completed/failed tasks
+        - issues: list of issues discovered during execution
+        - existing_backlog: current backlog items
+        - existing_analysis: previous analysis artifacts
+        """
+        pdca_cycle = context.get("pdca_cycle", 0)
+        task_results = context.get("task_results", {})
+        issues = context.get("issues", [])
+        existing_backlog = context.get("existing_backlog", [])
+        existing_analysis = context.get("existing_analysis", {})
+
+        completed = task_results.get("completed", 0)
+        failed = task_results.get("failed", 0)
+        total = task_results.get("total", 0)
+        success_rate = (completed / total * 100) if total > 0 else 0
+
+        updated_analysis = dict(existing_analysis) if existing_analysis else {}
+        updated_analysis.setdefault("pdca_history", []).append({
+            "cycle": pdca_cycle,
+            "completed": completed,
+            "failed": failed,
+            "success_rate": round(success_rate, 1),
+            "issues": [{"name": i.get("name", ""), "error": str(i.get("error", ""))[:200]} for i in issues[:10]],
+        })
+
+        new_tasks = []
+        for iss in issues:
+            new_tasks.append({
+                "name": f"fix_{iss.get('name', 'issue')}",
+                "description": (
+                    f"Fix issue from PDCA cycle {pdca_cycle}: "
+                    f"{str(iss.get('error', ''))[:200]}"
+                ),
+                "role": "developer",
+                "priority": "P1",
+                "depends_on": [],
+                "origin": "pdca_discovery",
+            })
+
+        quality_recommendations = []
+        if success_rate < 50:
+            quality_recommendations.append(
+                "Low success rate: consider re-analyzing requirements"
+            )
+        if failed > completed:
+            quality_recommendations.append(
+                "More failures than successes: review task decomposition"
+            )
+        if issues:
+            quality_recommendations.append(
+                f"{len(issues)} issues found: may need additional test coverage"
+            )
+
+        remaining_backlog = [
+            item for item in existing_backlog
+            if item.get("status") == "pending"
+        ]
+        for item in remaining_backlog:
+            if item.get("name") not in {t["name"] for t in new_tasks}:
+                new_tasks.append({
+                    "name": item["name"],
+                    "description": item.get("description", item["name"]),
+                    "role": item.get("role", "developer"),
+                    "priority": item.get("priority", "P2"),
+                    "depends_on": [],
+                    "origin": "backlog",
+                })
+
+        eval_report = self._format_eval_report(
+            pdca_cycle, completed, failed, total, success_rate,
+            issues, new_tasks, quality_recommendations
+        )
+
+        return {
+            "success": True,
+            "artifacts": {
+                "updated_analysis": updated_analysis,
+                "new_tasks": new_tasks,
+                "quality_recommendations": quality_recommendations,
+                "eval_report": eval_report,
+                "pdca_cycle": pdca_cycle,
+                "success_rate": round(success_rate, 1),
+                "work_remaining": len(new_tasks),
+            },
+        }
+
+    def _format_eval_report(
+        self, cycle, completed, failed, total, success_rate,
+        issues, new_tasks, recommendations
+    ) -> str:
+        lines = [
+            f"# PDCA Evaluation Report - Cycle {cycle}",
+            "",
+            f"## Results",
+            f"- Completed: {completed}/{total} ({success_rate:.0f}%)",
+            f"- Failed: {failed}/{total}",
+            f"- New tasks generated: {len(new_tasks)}",
+            "",
+        ]
+        if issues:
+            lines.append("## Issues")
+            for iss in issues[:10]:
+                lines.append(f"  - {iss.get('name', '?')}: {str(iss.get('error', ''))[:80]}")
+            lines.append("")
+        if new_tasks:
+            lines.append("## New Tasks")
+            for t in new_tasks[:15]:
+                origin = t.get("origin", "")
+                lines.append(f"  - [{t.get('priority', 'P2')}] {t.get('name', '?')} (from: {origin})")
+            lines.append("")
+        if recommendations:
+            lines.append("## Quality Recommendations")
+            for r in recommendations:
+                lines.append(f"  - {r}")
+        return "\n".join(lines)
 
     def _handle_clarify(
         self, task_description: str, context: Dict[str, Any]
@@ -695,6 +1060,13 @@ class Bmad_Evo_Adapter:
                 "recommended_roles": 3,
                 "risk_factors": ["Original bmad-evo not available"],
                 "success_criteria": [],
+                "roles": [
+                    {"type": "developer", "name": "developer", "capabilities": ["code", "test"]},
+                    {"type": "reviewer", "name": "reviewer", "capabilities": ["review", "quality"]},
+                ],
+                "tasks": [
+                    {"name": "analyze_and_implement", "description": task, "role": "developer", "priority": "P1", "depends_on": []},
+                ],
             },
         }
 
@@ -707,6 +1079,7 @@ class Bmad_Evo_Adapter:
             "decision_support",
             "clarification",
             "evolution",
+            "eval_and_update",
         ]
 
     def get_status(self) -> Dict[str, Any]:

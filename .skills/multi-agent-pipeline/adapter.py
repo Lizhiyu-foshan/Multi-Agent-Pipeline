@@ -73,6 +73,7 @@ class MultiAgentPipeline_Adapter:
             "dispatch_subagents": self._action_dispatch_subagents,
             "receive_subagent_results": self._action_receive_subagent_results,
             "resume_model_request": self._action_resume_model_request,
+            "retry_model_request": self._action_retry_model_request,
             "get_active_session": self._action_get_active_session,
         }
 
@@ -101,7 +102,7 @@ class MultiAgentPipeline_Adapter:
         self, description: str, context: Dict[str, Any]
     ) -> Dict[str, Any]:
         orch = self._get_orchestrator()
-        max_hours = context.get("max_duration_hours", 5.0)
+        max_hours = context.get("max_duration_hours")
         pipeline, next_action = orch.create_pipeline(description, max_hours)
         return {
             "success": True,
@@ -335,6 +336,24 @@ class MultiAgentPipeline_Adapter:
             "model_request",
             "execute_next_task",
             "check",
+        )
+        return result
+
+    def _action_retry_model_request(
+        self, description: str, context: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Re-issue an active model request after timeout/rate-limit."""
+        session_id = context.get("session_id", "")
+        reason = context.get("reason", "timeout")
+
+        if not session_id:
+            return {"success": False, "error": "session_id required"}
+
+        orch = self._get_orchestrator()
+        result = orch.retry_model_request(session_id, reason=reason)
+        result["success"] = result.get("success", True) or result.get("action") in (
+            "model_request",
+            "model_request_retry_exhausted",
         )
         return result
 
