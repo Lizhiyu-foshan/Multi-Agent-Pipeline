@@ -40,7 +40,10 @@ class PlatformAdapter(ABC):
     @abstractmethod
     def execute_skill(skill_name: str, context: Dict) -> Any:
         """执行 Skill"""
-        pass
+        raise NotImplementedError(
+            "OpenCodeAdapter.execute_skill is not implemented. "
+            "Use platform-specific runtime integration to execute skills."
+        )
 
 
 def detect_platform() -> str:
@@ -85,7 +88,10 @@ class OpenCodeAdapter(PlatformAdapter):
     @staticmethod
     def execute_skill(skill_name: str, context: Dict) -> Any:
         """执行 Skill"""
-        pass
+        raise NotImplementedError(
+            "OpenCodeAdapter.execute_skill is not implemented. "
+            "Use platform-specific runtime integration to execute skills."
+        )
 
 
 class ClaudeCodeAdapter(PlatformAdapter):
@@ -128,7 +134,10 @@ class ClaudeCodeAdapter(PlatformAdapter):
     @staticmethod
     def execute_skill(skill_name: str, context: Dict) -> Any:
         """执行 Skill"""
-        pass
+        raise NotImplementedError(
+            "ClaudeCodeAdapter.execute_skill is not implemented. "
+            "Use platform-specific runtime integration to execute skills."
+        )
 
 
 class OpenClawAdapter(PlatformAdapter):
@@ -162,7 +171,10 @@ class OpenClawAdapter(PlatformAdapter):
     @staticmethod
     def execute_skill(skill_name: str, context: Dict) -> Any:
         """执行 Skill"""
-        pass
+        raise NotImplementedError(
+            "OpenClawAdapter.execute_skill is not implemented. "
+            "Use platform-specific runtime integration to execute skills."
+        )
 
 
 class GenericAdapter(PlatformAdapter):
@@ -186,4 +198,6 @@ class GenericAdapter(PlatformAdapter):
     @staticmethod
     def execute_skill(skill_name: str, context: Dict) -> Any:
         """执行 Skill"""
-        pass
+        raise NotImplementedError(
+            "GenericAdapter.execute_skill is not implemented for unknown platforms."
+        )
