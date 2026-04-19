@@ -203,6 +203,45 @@ class TestIncrementalSnapshots:
         assert restored is not None
         assert restored["snapshot"]["pipeline"]["pdca_cycle"] == 3
 
+    def test_restore_to_phase_reconstructs_delta_snapshot(self, temp_dir):
+        cm = CheckpointManager(state_dir=temp_dir)
+        pipeline = PipelineRun(id="pipe_phase_restore", description="test")
+        pipeline.state = PipelineState.RUNNING.value
+
+        cm.create_full_snapshot(pipeline, {"pending": 1}, {"roles": []}, label="base")
+        pipeline.phase = PipelinePhase.EXECUTE.value
+        pipeline.tasks = ["task_1"]
+        cm.create_full_snapshot(
+            pipeline, {"pending": 2, "completed": 1}, {"roles": []}, label="exec_delta"
+        )
+
+        restored = cm.restore_to_phase("pipe_phase_restore", PipelinePhase.EXECUTE.value)
+        assert restored is not None
+        snap = restored["snapshot"]
+        assert "pipeline" in snap
+        assert snap["pipeline"]["phase"] == PipelinePhase.EXECUTE.value
+        assert snap["pipeline"]["tasks"] == ["task_1"]
+        assert snap["task_queue_snapshot"]["pending"] == 2
+
+    def test_restore_by_label_reconstructs_delta_snapshot(self, temp_dir):
+        cm = CheckpointManager(state_dir=temp_dir)
+        pipeline = PipelineRun(id="pipe_label_restore", description="test")
+        pipeline.state = PipelineState.RUNNING.value
+
+        cm.create_full_snapshot(pipeline, {"pending": 1}, {"roles": []}, label="base")
+        pipeline.phase = PipelinePhase.CHECK.value
+        pipeline.pdca_cycle = 1
+        cm.create_full_snapshot(
+            pipeline, {"pending": 0, "completed": 1}, {"roles": []}, label="target_label"
+        )
+
+        restored = cm.restore_by_label("pipe_label_restore", "target_label")
+        assert restored is not None
+        snap = restored["snapshot"]
+        assert "pipeline" in snap
+        assert snap["pipeline"]["phase"] == PipelinePhase.CHECK.value
+        assert snap["pipeline"]["pdca_cycle"] == 1
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

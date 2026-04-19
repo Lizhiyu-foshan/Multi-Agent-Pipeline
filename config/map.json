@@ -1,0 +1,29 @@
+{
+  "pipeline": {
+    "default_max_duration_hours": 5.0,
+    "decision_timeout_seconds": 1800.0,
+    "auto_continue": false
+  },
+  "model_request_retry": {
+    "max_retries": 5,
+    "base_delay_seconds": 5,
+    "max_delay_seconds": 120
+  },
+  "watchdog": {
+    "enabled": true,
+    "check_interval_seconds": 30.0,
+    "task_stall_threshold_seconds": 1800.0,
+    "session_idle_threshold_seconds": 7200.0,
+    "progress_stall_threshold_seconds": 3600.0,
+    "auto_recover": false,
+    "max_auto_recover_attempts": 2,
+    "auto_retry_stalled_tasks": true,
+    "auto_retry_idle_model_request": true,
+    "model_request_retry_max_attempts": 10,
+    "model_request_retry_cooldown_seconds": 60.0,
+    "model_request_retry_reason": "watchdog_session_idle"
+  },
+  "parallel_executor": {
+    "timeout_per_task": 600.0
+  }
+}

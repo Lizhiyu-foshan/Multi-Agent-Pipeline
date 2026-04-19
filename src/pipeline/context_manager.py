@@ -394,7 +394,7 @@ class ContextManager:
                             "task_id": e.task_id,
                             "role_id": e.role_id,
                             "phase": e.phase,
-                            "content": e.content,
+                            "content": self._redact_text(e.content),
                             "timestamp": e.timestamp,
                             "token_count": e.token_count,
                         }

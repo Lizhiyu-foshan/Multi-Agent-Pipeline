@@ -217,7 +217,12 @@ class CheckpointManager:
         if not phase_ckpts:
             logger.warning(f"No checkpoint at phase {phase} for {pipeline_id}")
             return None
-        return self._load_checkpoint(phase_ckpts[-1]["id"])
+        target = phase_ckpts[-1]
+        data = self._load_checkpoint(target["id"])
+        if data and data.get("snapshot", {}).get("is_delta"):
+            chain = self._checkpoint_chain_to(checkpoints, target["id"])
+            data["snapshot"] = self._reconstruct_from_delta(pipeline_id, chain)
+        return data
 
     def restore_by_label(
         self, pipeline_id: str, label: str
@@ -227,7 +232,20 @@ class CheckpointManager:
         if not labeled:
             logger.warning(f"No checkpoint with label '{label}' for {pipeline_id}")
             return None
-        return self._load_checkpoint(labeled[-1]["id"])
+        target = labeled[-1]
+        data = self._load_checkpoint(target["id"])
+        if data and data.get("snapshot", {}).get("is_delta"):
+            chain = self._checkpoint_chain_to(checkpoints, target["id"])
+            data["snapshot"] = self._reconstruct_from_delta(pipeline_id, chain)
+        return data
+
+    def _checkpoint_chain_to(
+        self, checkpoints: List[Dict[str, Any]], checkpoint_id: str
+    ) -> List[Dict[str, Any]]:
+        for i, meta in enumerate(checkpoints):
+            if meta.get("id") == checkpoint_id:
+                return checkpoints[: i + 1]
+        return checkpoints
 
     def list_checkpoints(self, pipeline_id: str) -> List[Dict[str, Any]]:
         ckpt_dir = self.state_dir / pipeline_id
