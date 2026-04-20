@@ -331,6 +331,7 @@ class SelfBootstrapDriver:
         self.dry_run = dry_run
         self.state_dir = os.path.join(self.project_root, ".pipeline")
         self.model_bridge = LocalModelBridge(self.project_root)
+        self.model_manager = self._init_model_manager()
         self.skills: Dict[str, Any] = {}
         self.orchestrator = None
         self.pipeline_id = None
@@ -629,6 +630,47 @@ class SelfBootstrapDriver:
         self.last_backlog_signature = signature
         return self.stagnation_rounds >= self.max_stagnation_rounds
 
+    def _init_model_manager(self):
+        try:
+            sys.path.insert(0, str(PROJECT_ROOT / "src"))
+            from pipeline.model_bridge import ModelBridgeManager
+
+            cfg_path = PROJECT_ROOT / "config" / "map.json"
+            cfg = {}
+            if cfg_path.exists():
+                import json as _json
+                with open(cfg_path, "r", encoding="utf-8") as f:
+                    cfg = _json.load(f)
+
+            mgr = ModelBridgeManager(config=cfg)
+            mgr.load_strategies(project_root=self.project_root)
+            hc = mgr.health_check()
+            logger.info(f"ModelManager initialized: strategies={list(hc['registered'].keys())}, default={hc['default_strategy']}")
+            return mgr
+        except Exception as e:
+            logger.warning(f"ModelManager init failed, using LocalModelBridge fallback: {e}")
+            return None
+
+    def _call_model(self, prompt: str, context: Dict[str, Any]) -> str:
+        if self.model_manager:
+            try:
+                task_type = context.get("model_request_type", "")
+                resp = self.model_manager.call(
+                    prompt=prompt,
+                    model="",
+                    task_type=task_type,
+                    context=context,
+                )
+                if resp.success and resp.content:
+                    logger.info(f"  Model response via {resp.raw.get('strategy', 'unknown')}: {len(resp.content)} chars")
+                    return resp.content
+                if not resp.success:
+                    logger.warning(f"  Model call failed ({resp.error[:200]}), falling back to synthetic")
+            except Exception as e:
+                logger.warning(f"  Model call exception ({e}), falling back to synthetic")
+
+        return self.model_bridge.respond(prompt, context)
+
     def _handle_action(self, result: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         action = result.get("action", "unknown")
 
@@ -651,7 +693,7 @@ class SelfBootstrapDriver:
             if prompt_kb > 80:
                 logger.warning(f"  Prompt exceeds 80KB ({prompt_kb:.1f}KB), context may be bloated")
 
-            response = self.model_bridge.respond(prompt, result)
+            response = self._call_model(prompt, result)
 
             logger.info(
                 f"  Resuming model request with response ({len(response)} chars)"

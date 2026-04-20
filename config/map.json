@@ -4,6 +4,39 @@
     "decision_timeout_seconds": 1800.0,
     "auto_continue": false
   },
+  "models": {
+    "default_strategy": "synthetic",
+    "default_model": "glm-5.1",
+    "max_tokens": 4096,
+    "temperature": 0.7,
+    "timeout": 120,
+    "routing": {
+      "glm-5.1": "http",
+      "glm-4-plus": "http",
+      "task:analyze": "http",
+      "task:plan": "http",
+      "task:review": "http",
+      "task:implement": "http",
+      "task:debug": "http"
+    },
+    "fallback_chain": ["http", "opencode", "synthetic"],
+    "strategies": {
+      "http": {
+        "enabled": false,
+        "api_key": "",
+        "api_base": "https://open.bigmodel.cn/api/paas/v4",
+        "default_model": "glm-5.1",
+        "timeout": 120
+      },
+      "opencode": {
+        "enabled": false
+      },
+      "synthetic": {
+        "enabled": true,
+        "enable_test_runner": true
+      }
+    }
+  },
   "model_request_retry": {
     "max_retries": 5,
     "base_delay_seconds": 5,

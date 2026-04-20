@@ -119,6 +119,7 @@ class PipelineOrchestrator:
         skills: Dict[str, Any] = None,
         spec_gate: Any = None,
         watchdog_config: Dict[str, Any] = None,
+        model_bridge: Any = None,
     ):
         if state_dir is None:
             state_dir = str(Path.cwd() / ".pipeline")
@@ -202,6 +203,18 @@ class PipelineOrchestrator:
 
         self._load_pipelines()
         self._load_hooks_state()
+
+        self._model_bridge = model_bridge
+        if self._model_bridge is None:
+            try:
+                from .model_bridge import ModelBridgeManager
+                self._model_bridge = ModelBridgeManager(config=self._runtime_config)
+                self._model_bridge.load_strategies(
+                    project_root=str(Path(state_dir).parent) if state_dir else ""
+                )
+            except Exception as e:
+                logger.debug(f"ModelBridgeManager not initialized: {e}")
+                self._model_bridge = None
 
     def _init_watchdog(self, config: Dict[str, Any]):
         from .pipeline_watchdog import PipelineWatchdog, WatchdogConfig
