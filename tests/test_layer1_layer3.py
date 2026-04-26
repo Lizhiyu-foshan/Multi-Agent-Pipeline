@@ -469,3 +469,26 @@ class TestEvolveFlowAndRoleRouting:
         result = orch._handle_execute(p, {})
         assert result.get("action") == "failed"
         assert "Unknown role type" in result.get("reason", "")
+
+
+class TestExecutePipelineScopedStats:
+    def test_execute_transitions_to_check_ignoring_other_pipeline_pending(self, orch):
+        p1 = _create_pipeline(orch)
+        p1.phase = PipelinePhase.EXECUTE.value
+        p1.state = PipelineState.RUNNING
+
+        t1 = _submit_task(orch, p1.id, "p1_done", "completed")
+        p1.tasks = [t1]
+
+        p2 = _create_pipeline(orch)
+        p2.phase = PipelinePhase.EXECUTE.value
+        p2.state = PipelineState.RUNNING
+        t2 = _submit_task(orch, p2.id, "p2_pending", "pending")
+        p2.tasks = [t2]
+
+        orch._save_pipelines()
+
+        result = orch._handle_execute(p1, {})
+
+        assert result.get("action") == "check"
+        assert p1.phase == PipelinePhase.CHECK.value

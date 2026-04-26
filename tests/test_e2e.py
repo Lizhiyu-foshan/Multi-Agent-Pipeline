@@ -1546,6 +1546,11 @@ def test_orchestrator_resume_model_request():
 
         invalid = orch.resume_model_request("nonexistent_session", "test")
         _assert("error" in invalid, "Error for nonexistent session")
+        _assert(
+            invalid.get("error_code") in ("SESSION_NOT_FOUND", "SESSION_EXPIRED", "SESSION_DEAD"),
+            f"Has diagnostic error_code: {invalid.get('error_code')}",
+        )
+        _assert("diagnostic" in invalid, "Has diagnostic payload")
 
         print(f"  2-round model interaction completed")
         print(f"  Session 1: {session_id}, Session 2: {session_id_2}")

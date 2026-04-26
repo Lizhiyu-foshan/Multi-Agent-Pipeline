@@ -945,3 +945,167 @@ class TestStagnationGuard:
         ]
         assert driver._is_stagnating() is False
         assert driver.stagnation_rounds == 0
+
+
+class TestCrossProcessSessionRoundTrip:
+    def test_init_save_load_respond_completes_analyze(self):
+        d = tempfile.mkdtemp()
+        try:
+            from pipeline.runner import PipelineRunner
+
+            runner = PipelineRunner(
+                project_root=str(PROJECT_ROOT),
+                description="Test cross-process round-trip",
+                model_mode="synthetic",
+                state_dir=d,
+                skip_skill_analysis=True,
+            )
+            runner.setup()
+            runner._load_initial_backlog()
+            runner.start_time = datetime.now()
+
+            result = runner.step()
+            assert result.get("needs_model") is True
+            assert result.get("action") == "analyze"
+
+            session_path = os.path.join(d, "runner_session.json")
+            runner.save_session()
+            assert os.path.exists(session_path)
+
+            runner2 = PipelineRunner.load_session(session_path)
+            assert runner2.pipeline_id == runner.pipeline_id
+            assert runner2._last_result.get("action") == "analyze"
+            assert runner2._pending_analysis is None
+
+            analysis = json.dumps({
+                "success": True,
+                "artifacts": {
+                    "roles": [{"type": "developer", "name": "dev", "capabilities": ["code"]}],
+                    "tasks": [{"name": "t1", "description": "Do it", "role": "developer", "depends_on": [], "priority": "P1"}],
+                },
+            })
+            result2 = runner2.respond(analysis)
+            assert not result2.get("error"), f"respond failed: {result2}"
+            assert result2.get("needs_model") is True or result2.get("done") is True
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+
+class TestRequireRealModelGuard:
+    def test_call_model_raises_without_ipc_listener_when_required(self):
+        from pipeline.runner import PipelineRunner
+
+        d = tempfile.mkdtemp()
+        try:
+            runner = PipelineRunner(
+                project_root=str(PROJECT_ROOT),
+                description="real-model required",
+                model_mode="opencode_ipc",
+                state_dir=d,
+                require_real_model=True,
+            )
+            runner.pipeline_id = "pipe_test"
+
+            with patch("pipeline.runner.time.time", side_effect=[100.0, 103.2]):
+                with pytest.raises(RuntimeError, match="No IPC listener"):
+                    runner._call_model("Analyze this", {"action": "analyze"})
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_call_model_falls_back_to_synthetic_when_not_required(self):
+        from pipeline.runner import PipelineRunner
+
+        d = tempfile.mkdtemp()
+        try:
+            runner = PipelineRunner(
+                project_root=str(PROJECT_ROOT),
+                description="fallback allowed",
+                model_mode="opencode_ipc",
+                state_dir=d,
+                require_real_model=False,
+            )
+            runner.pipeline_id = "pipe_test"
+
+            with patch("pipeline.runner.time.time", side_effect=[200.0, 203.2]):
+                response = runner._call_model("Analyze task breakdown", {"action": "analyze"})
+
+            parsed = json.loads(response)
+            assert isinstance(parsed, dict)
+            assert "tasks" in parsed
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+
+class TestCrossProcessSessionPersistence:
+
+    def test_init_save_load_step_produces_same_state(self):
+        d = tempfile.mkdtemp()
+        try:
+            from pipeline.runner import PipelineRunner
+
+            runner = PipelineRunner(
+                project_root=str(PROJECT_ROOT),
+                description="Session persistence test",
+                model_mode="synthetic",
+                state_dir=d,
+                skip_skill_analysis=True,
+            )
+            runner.setup()
+            runner._load_initial_backlog()
+            runner.start_time = datetime.now()
+
+            result1 = runner.step()
+
+            session_path = os.path.join(d, "runner_session.json")
+            runner.save_session()
+
+            runner2 = PipelineRunner.load_session(session_path)
+            assert runner2.pipeline_id == runner.pipeline_id
+            assert runner2.total_pipelines == runner.total_pipelines
+            assert runner2.iteration == runner.iteration
+
+            result2 = runner2.step()
+            assert result2.get("action") == result1.get("action")
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_full_step_respond_cycle_through_analyze_and_plan(self):
+        d = tempfile.mkdtemp()
+        try:
+            from pipeline.runner import PipelineRunner
+
+            runner = PipelineRunner(
+                project_root=str(PROJECT_ROOT),
+                description="Full cycle test",
+                model_mode="synthetic",
+                state_dir=d,
+                skip_skill_analysis=True,
+            )
+            runner.setup()
+            runner._load_initial_backlog()
+            runner.start_time = datetime.now()
+
+            result = runner.step()
+            assert result.get("action") == "analyze"
+
+            analysis = json.dumps({
+                "success": True,
+                "artifacts": {
+                    "roles": [{"type": "developer", "name": "dev", "capabilities": ["code"]}],
+                    "tasks": [
+                        {"name": "t1", "description": "First", "role": "developer", "depends_on": [], "priority": "P1"},
+                        {"name": "t2", "description": "Second", "role": "developer", "depends_on": ["t1"], "priority": "P2"},
+                    ],
+                },
+            })
+            result2 = runner.respond(analysis)
+            assert not result2.get("error"), f"respond(analysis) failed: {result2}"
+
+            session_path = os.path.join(d, "runner_session.json")
+            runner.save_session()
+
+            runner3 = PipelineRunner.load_session(session_path)
+            result3 = runner3.step()
+            assert not result3.get("error"), f"step after load failed: {result3}"
+        finally:
+            shutil.rmtree(d, ignore_errors=True)

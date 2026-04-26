@@ -10,16 +10,8 @@
     "max_tokens": 4096,
     "temperature": 0.7,
     "timeout": 120,
-    "routing": {
-      "glm-5.1": "http",
-      "glm-4-plus": "http",
-      "task:analyze": "http",
-      "task:plan": "http",
-      "task:review": "http",
-      "task:implement": "http",
-      "task:debug": "http"
-    },
-    "fallback_chain": ["http", "opencode", "synthetic"],
+    "routing": {},
+    "fallback_chain": ["synthetic"],
     "strategies": {
       "http": {
         "enabled": false,

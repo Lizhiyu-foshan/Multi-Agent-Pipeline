@@ -1,0 +1,46 @@
+format:
+  dependency_direction:
+  - from: ui
+    to:
+    - services
+    description: UI can only call service layer
+  - from: services
+    to:
+    - data
+    - external
+    description: Services can access data and external APIs
+  - from: data
+    to: []
+    description: Data layer has no upstream dependencies
+  file_size_limit:
+    lines: 300
+    description: No single file should exceed this line count
+  naming_conventions:
+    files: snake_case
+    classes: PascalCase
+    functions: snake_case
+    constants: UPPER_SNAKE_CASE
+    test_files: test_*.py
+contract:
+- rule: API endpoints must return consistent error format
+  scope: global
+  details: 'All errors use {error: string, code: string, details?: object}'
+- rule: All mutations must be idempotent
+  scope: services
+  details: Same request twice = same result
+- rule: Input validation happens at boundary
+  scope: services
+  details: Validate at API entry point, not deep in business logic
+behavior:
+- rule: Graceful degradation on external service failure
+  applies_to:
+  - '*'
+  details: Return cached data or meaningful error, never crash
+- rule: All user-facing strings must be i18n-ready
+  applies_to:
+  - ui
+  details: Use i18n keys, not hardcoded strings
+- rule: Logging must not contain sensitive data
+  applies_to:
+  - '*'
+  details: No passwords, tokens, PII in logs

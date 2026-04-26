@@ -42,6 +42,7 @@ from project_manage.delivery import DeliveryManager
 from project_manage.approval import ApprovalManager
 from project_manage.audit import AuditLogger
 from project_manage.metrics import MetricsAggregator
+from project_manage.change_control import ChangeControlManager
 
 
 @pytest.fixture
@@ -374,6 +375,48 @@ class TestGates:
         )
         assert result["artifacts"]["baseline_pass"] is False
 
+    def test_high_risk_blocks_gate_without_override(self, gates):
+        result = gates.evaluate(
+            "proj_1",
+            {
+                "risk_level": "high",
+                "quality_pass": True,
+                "compat_pass": True,
+            },
+        )
+        assert result["artifacts"]["decision"] == "blocked"
+        assert result["artifacts"]["details"]["risk"]["pass"] is False
+
+    def test_high_risk_can_pass_with_override(self, gates):
+        result = gates.evaluate(
+            "proj_1",
+            {
+                "risk_level": "high",
+                "allow_high_risk": True,
+                "quality_pass": True,
+                "compat_pass": True,
+            },
+        )
+        assert result["artifacts"]["decision"] == "pass"
+        assert result["artifacts"]["details"]["risk"]["pass"] is True
+
+    def test_contamination_blocked_fails_gate(self, gates):
+        result = gates.evaluate(
+            "proj_1",
+            {
+                "contamination_result": {
+                    "artifacts": {
+                        "status": "blocked",
+                        "top_severity": "critical",
+                    }
+                },
+                "quality_pass": True,
+                "compat_pass": True,
+            },
+        )
+        assert result["artifacts"]["decision"] == "blocked"
+        assert result["artifacts"]["details"]["contamination"]["pass"] is False
+
 
 # ===== Delivery =====
 
@@ -459,6 +502,108 @@ class TestDelivery:
         assert not gate_result["success"]
         dlv = dm.get_delivery(dlv_id)
         assert dlv.status == DeliveryStatus.STAGED.value
+
+    def test_evaluate_gates_blocks_on_change_contamination(self, temp_dir):
+        source_dir = os.path.join(temp_dir, "src_contam")
+        target_dir = os.path.join(temp_dir, "tgt_contam")
+        os.makedirs(os.path.join(source_dir, "src"), exist_ok=True)
+        os.makedirs(target_dir, exist_ok=True)
+        Path(source_dir, "src", "secrets.py").write_text(
+            "API_KEY='abcdef123456'\n", encoding="utf-8"
+        )
+
+        dm = DeliveryManager(state_dir=temp_dir)
+        stage_result = dm.deliver_local(
+            {
+                "delivery_action": "stage",
+                "project_id": "proj_contam_block",
+                "files": ["src/secrets.py"],
+                "target_path": target_dir,
+                "source_dir": source_dir,
+            }
+        )
+        dlv_id = stage_result["artifacts"]["delivery_id"]
+
+        gate_result = dm.deliver_local(
+            {
+                "delivery_action": "evaluate_gates",
+                "delivery_id": dlv_id,
+                "baseline_result": True,
+                "quality_pass": True,
+                "compat_pass": True,
+            }
+        )
+        assert not gate_result["success"]
+        assert gate_result["artifacts"]["gate"]["details"]["contamination"]["pass"] is False
+
+    def test_evaluate_gates_blocks_high_risk_without_override(self, temp_dir):
+        source_dir = os.path.join(temp_dir, "src_risk")
+        target_dir = os.path.join(temp_dir, "tgt_risk")
+        os.makedirs(os.path.join(source_dir, "src", "auth"), exist_ok=True)
+        os.makedirs(target_dir, exist_ok=True)
+        Path(source_dir, "src", "auth", "service.py").write_text(
+            "def login():\n    return True\n", encoding="utf-8"
+        )
+
+        dm = DeliveryManager(state_dir=temp_dir)
+        stage_result = dm.deliver_local(
+            {
+                "delivery_action": "stage",
+                "project_id": "proj_risk_block",
+                "files": ["src/auth/service.py"],
+                "target_path": target_dir,
+                "source_dir": source_dir,
+            }
+        )
+        dlv_id = stage_result["artifacts"]["delivery_id"]
+
+        gate_result = dm.deliver_local(
+            {
+                "delivery_action": "evaluate_gates",
+                "delivery_id": dlv_id,
+                "drift_severity": "high",
+                "baseline_result": True,
+                "quality_pass": True,
+                "compat_pass": True,
+            }
+        )
+        assert not gate_result["success"]
+        assert gate_result["artifacts"]["gate"]["details"]["risk"]["pass"] is False
+
+    def test_evaluate_gates_allows_high_risk_with_override(self, temp_dir):
+        source_dir = os.path.join(temp_dir, "src_risk_ok")
+        target_dir = os.path.join(temp_dir, "tgt_risk_ok")
+        os.makedirs(os.path.join(source_dir, "src", "auth"), exist_ok=True)
+        os.makedirs(target_dir, exist_ok=True)
+        Path(source_dir, "src", "auth", "service.py").write_text(
+            "def login():\n    return True\n", encoding="utf-8"
+        )
+
+        dm = DeliveryManager(state_dir=temp_dir)
+        stage_result = dm.deliver_local(
+            {
+                "delivery_action": "stage",
+                "project_id": "proj_risk_ok",
+                "files": ["src/auth/service.py"],
+                "target_path": target_dir,
+                "source_dir": source_dir,
+            }
+        )
+        dlv_id = stage_result["artifacts"]["delivery_id"]
+
+        gate_result = dm.deliver_local(
+            {
+                "delivery_action": "evaluate_gates",
+                "delivery_id": dlv_id,
+                "drift_severity": "high",
+                "allow_high_risk": True,
+                "baseline_result": True,
+                "quality_pass": True,
+                "compat_pass": True,
+            }
+        )
+        assert gate_result["success"]
+        assert gate_result["artifacts"]["status"] == "gate_passed"
 
     def test_request_approval_wrong_status(self, temp_dir):
         dm = DeliveryManager(state_dir=temp_dir)
@@ -684,6 +829,167 @@ class TestMetrics:
         assert "avg_completion_rate" in result["artifacts"]["progress"]
 
 
+# ===== Change Control =====
+
+
+class TestChangeControl:
+    def test_risk_assessment_flags_high_risk_changes(self, temp_dir):
+        reg = ProjectRegistry(state_dir=temp_dir)
+        cc = ChangeControlManager(state_dir=temp_dir, registry=reg)
+
+        result = cc.assess_risk(
+            "proj_risk",
+            {
+                "files": [
+                    "src/auth/service.py",
+                    "src/payment/gateway.py",
+                    "src/core/app.py",
+                ],
+                "drift_severity": "high",
+            },
+        )
+        assert result["success"]
+        assert result["artifacts"]["level"] in ("high", "critical")
+        assert result["artifacts"]["score"] >= 40
+
+    def test_contamination_check_blocks_on_secret_and_conflict_markers(self, temp_dir):
+        reg = ProjectRegistry(state_dir=temp_dir)
+        cc = ChangeControlManager(state_dir=temp_dir, registry=reg)
+
+        result = cc.assess_contamination(
+            "proj_contam",
+            {
+                "files": ["src/config.py"],
+                "file_contents": {
+                    "src/config.py": (
+                        "API_KEY='abcdef123456'\n"
+                        "<<<<<<< HEAD\n"
+                        "value = 1\n"
+                        "=======\n"
+                        "value = 2\n"
+                        ">>>>>>> branch\n"
+                    )
+                },
+            },
+        )
+        assert not result["success"]
+        assert result["artifacts"]["status"] == "blocked"
+        assert result["artifacts"]["top_severity"] in ("high", "critical")
+
+    def test_backup_record_and_list_versions(self, temp_dir):
+        reg = ProjectRegistry(state_dir=temp_dir)
+        target = os.path.join(temp_dir, "cc_proj")
+        os.makedirs(os.path.join(target, "src"), exist_ok=True)
+        Path(target, "src", "main.py").write_text("print('ok')", encoding="utf-8")
+
+        p = ProjectRecord(name="CCProj", target_path=target)
+        reg.register(p)
+
+        cc = ChangeControlManager(state_dir=temp_dir, registry=reg)
+        backup = cc.create_compressed_backup(
+            p.project_id,
+            {
+                "source_path": target,
+                "version_id": "v100",
+                "files": ["src/main.py"],
+            },
+        )
+        assert backup["success"]
+        assert os.path.exists(backup["artifacts"]["backup_path"])
+
+        record = cc.record_version(
+            p.project_id,
+            {
+                "version_id": "v100",
+                "change_summary": "baseline change",
+                "files": ["src/main.py"],
+                "backup_path": backup["artifacts"]["backup_path"],
+            },
+        )
+        assert record["success"]
+
+        versions = cc.list_versions(p.project_id)
+        assert versions["success"]
+        assert versions["artifacts"]["total"] >= 1
+        assert versions["artifacts"]["versions"][0]["version_id"] == "v100"
+
+    def test_merge_update_dry_run_and_risk_block(self, temp_dir):
+        reg = ProjectRegistry(state_dir=temp_dir)
+        p = ProjectRecord(name="DryRunProj", target_path=temp_dir)
+        reg.register(p)
+
+        cc = ChangeControlManager(state_dir=temp_dir, registry=reg)
+
+        blocked = cc.merge_update(
+            p.project_id,
+            {
+                "operation": "merge",
+                "risk_level": "critical",
+                "dry_run": True,
+            },
+        )
+        assert not blocked["success"]
+
+        dry_run = cc.merge_update(
+            p.project_id,
+            {
+                "operation": "update",
+                "risk_level": "low",
+                "dry_run": True,
+            },
+        )
+        assert dry_run["success"]
+        assert dry_run["artifacts"]["status"] == "planned"
+
+    def test_change_flow_success_with_backup_and_record(self, temp_dir):
+        reg = ProjectRegistry(state_dir=temp_dir)
+        target = os.path.join(temp_dir, "flow_proj")
+        os.makedirs(os.path.join(target, "src"), exist_ok=True)
+        Path(target, "src", "main.py").write_text("value = 1\n", encoding="utf-8")
+
+        p = ProjectRecord(name="FlowProj", target_path=target)
+        reg.register(p)
+
+        cc = ChangeControlManager(state_dir=temp_dir, registry=reg)
+        result = cc.run_change_flow(
+            p.project_id,
+            {
+                "files": ["src/main.py"],
+                "source_path": target,
+                "change_summary": "flow baseline",
+                "version_id": "vflow1",
+            },
+        )
+        assert result["success"]
+        assert result["artifacts"]["version"] == "vflow1"
+        assert os.path.exists(result["artifacts"]["backup"]["backup_path"])
+        assert result["artifacts"]["version_record"]["version_id"] == "vflow1"
+
+    def test_change_flow_blocked_by_contamination(self, temp_dir):
+        reg = ProjectRegistry(state_dir=temp_dir)
+        target = os.path.join(temp_dir, "flow_blocked")
+        os.makedirs(os.path.join(target, "src"), exist_ok=True)
+        Path(target, "src", "config.py").write_text(
+            "API_KEY='abcdef123456'\n", encoding="utf-8"
+        )
+
+        p = ProjectRecord(name="FlowBlocked", target_path=target)
+        reg.register(p)
+
+        cc = ChangeControlManager(state_dir=temp_dir, registry=reg)
+        result = cc.run_change_flow(
+            p.project_id,
+            {
+                "files": ["src/config.py"],
+                "source_path": target,
+                "change_summary": "should block",
+            },
+        )
+        assert not result["success"]
+        assert result["artifacts"]["blocked"] is True
+        assert result["artifacts"]["contamination"]["status"] == "blocked"
+
+
 # ===== Adapter =====
 
 
@@ -837,6 +1143,219 @@ class TestAdapter:
         )
         assert result["success"]
         assert result["artifacts"]["status"] == "staged"
+
+    def test_doc_versioning_and_active_tracking(self, temp_dir):
+        adapter = self._load_adapter(temp_dir)
+        target = os.path.join(temp_dir, "doc_proj")
+        init = adapter.execute(
+            "Doc project",
+            {
+                "action": "project_init",
+                "mode": "new",
+                "name": "DocProj",
+                "target_path": target,
+            },
+        )
+        assert init["success"]
+        pid = init["artifacts"]["project"]["project_id"]
+
+        upsert_v1 = adapter.execute(
+            "",
+            {
+                "action": "doc_upsert",
+                "project_id": pid,
+                "category": "design_doc",
+                "title": "Design v1",
+                "content": "# Design v1\n\nInitial design.",
+            },
+        )
+        assert upsert_v1["success"]
+        assert upsert_v1["artifacts"]["document"]["version_id"] == "v1"
+
+        upsert_v2 = adapter.execute(
+            "",
+            {
+                "action": "doc_upsert",
+                "project_id": pid,
+                "category": "design_doc",
+                "title": "Design v2",
+                "content": "# Design v2\n\nUpdated design.",
+            },
+        )
+        assert upsert_v2["success"]
+        assert upsert_v2["artifacts"]["document"]["version_id"] == "v2"
+
+        docs = adapter.execute(
+            "",
+            {
+                "action": "doc_list",
+                "project_id": pid,
+                "category": "design_doc",
+            },
+        )
+        assert docs["success"]
+        design_versions = docs["artifacts"]["documents"]["design_doc"]
+        assert len(design_versions) == 2
+        assert docs["artifacts"]["active_versions"]["design_doc"] == "v2"
+
+        set_active = adapter.execute(
+            "",
+            {
+                "action": "doc_set_active",
+                "project_id": pid,
+                "category": "design_doc",
+                "version_id": "v1",
+            },
+        )
+        assert set_active["success"]
+        assert set_active["artifacts"]["active_version"] == "v1"
+
+    def test_project_todo_and_status_board(self, temp_dir):
+        adapter = self._load_adapter(temp_dir)
+        target = os.path.join(temp_dir, "status_proj")
+        init = adapter.execute(
+            "Status project",
+            {
+                "action": "project_init",
+                "mode": "new",
+                "name": "StatusProj",
+                "target_path": target,
+            },
+        )
+        assert init["success"]
+        pid = init["artifacts"]["project"]["project_id"]
+
+        todo_update = adapter.execute(
+            "",
+            {
+                "action": "project_todo_update",
+                "project_id": pid,
+                "todo_items": [
+                    {"title": "设计文档评审", "status": "completed", "owner": "analyst"},
+                    {"title": "开发工作计划拆解", "status": "in_progress", "owner": "pm"},
+                    {"title": "测试手册初稿", "status": "pending", "owner": "qa"},
+                ],
+            },
+        )
+        assert todo_update["success"]
+        assert todo_update["artifacts"]["todo_total"] == 3
+
+        status = adapter.execute(
+            "",
+            {
+                "action": "project_status",
+                "project_id": pid,
+            },
+        )
+        assert status["success"]
+        board = status["artifacts"]
+        assert board["todo_total"] == 3
+        assert board["todo_counts"]["completed"] == 1
+        assert board["todo_counts"]["in_progress"] == 1
+        assert board["todo_counts"]["pending"] == 1
+        assert board["progress_pct"] == pytest.approx(33.3, abs=0.2)
+
+    def test_change_control_actions_via_adapter(self, temp_dir):
+        adapter = self._load_adapter(temp_dir)
+        target = os.path.join(temp_dir, "cc_adapter_proj")
+        os.makedirs(os.path.join(target, "src"), exist_ok=True)
+        Path(target, "src", "app.py").write_text("print('hello')", encoding="utf-8")
+
+        init = adapter.execute(
+            "Change control project",
+            {
+                "action": "project_init",
+                "mode": "new",
+                "name": "CCAdapter",
+                "target_path": target,
+            },
+        )
+        assert init["success"]
+        pid = init["artifacts"]["project"]["project_id"]
+
+        risk = adapter.execute(
+            "",
+            {
+                "action": "risk_assess",
+                "project_id": pid,
+                "files": ["src/app.py"],
+                "drift_severity": "low",
+            },
+        )
+        assert risk["success"]
+
+        contam = adapter.execute(
+            "",
+            {
+                "action": "contamination_check",
+                "project_id": pid,
+                "files": ["src/app.py"],
+                "file_contents": {"src/app.py": "print('hello')"},
+            },
+        )
+        assert contam["success"]
+
+        backup = adapter.execute(
+            "",
+            {
+                "action": "version_backup",
+                "project_id": pid,
+                "source_path": target,
+                "version_id": "v1",
+                "files": ["src/app.py"],
+            },
+        )
+        assert backup["success"]
+
+        record = adapter.execute(
+            "",
+            {
+                "action": "version_record",
+                "project_id": pid,
+                "version_id": "v1",
+                "change_summary": "first stable version",
+                "files": ["src/app.py"],
+                "backup_path": backup["artifacts"]["backup_path"],
+            },
+        )
+        assert record["success"]
+
+        listing = adapter.execute(
+            "",
+            {
+                "action": "version_list",
+                "project_id": pid,
+            },
+        )
+        assert listing["success"]
+        assert listing["artifacts"]["total"] >= 1
+
+        merge_plan = adapter.execute(
+            "",
+            {
+                "action": "merge_update",
+                "project_id": pid,
+                "operation": "update",
+                "dry_run": True,
+                "risk_level": "low",
+            },
+        )
+        assert merge_plan["success"]
+        assert merge_plan["artifacts"]["status"] == "planned"
+
+        flow = adapter.execute(
+            "",
+            {
+                "action": "change_flow",
+                "project_id": pid,
+                "files": ["src/app.py"],
+                "source_path": target,
+                "version_id": "v2",
+                "change_summary": "adapter flow",
+            },
+        )
+        assert flow["success"]
+        assert flow["artifacts"]["version"] == "v2"
 
 
 # ===== Phase 2 Integration Tests =====

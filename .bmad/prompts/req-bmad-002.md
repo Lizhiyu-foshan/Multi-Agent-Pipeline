@@ -3,22 +3,14 @@
 **Caller**: ModelBridge
 **Model**: glm-4.7
 **Type**: model_inference
-**Created**: 2026-04-19T12:01:48.744758
+**Created**: 2026-04-20T22:43:53.948246
 
 ## Prompt
 
 你是一个智能任务分析专家。请分析以下任务，并提供结构化的分析结果。
 
 ## 任务描述
-Create detailed execution plan based on analysis.
-
-Description: Create detailed execution plan based on analysis.
-
-Tasks: [{"name": "verify_existing_tests", "description": "Run existing test suite to confirm baseline", "role": "developer", "depends_on": [], "priority": "P1"}, {"name": "implement_remaining_features", "description": "Implement any remaining project-manage features from backlog", "role": "developer", "depends_on": ["verify_existing_tests"], "priority": "P1"}, {"name": "write_integration_tests", "description": "Write comprehensive integration tests", "role": "developer", "depends_on": ["implement_remaining_features"], "priority": "P1"}, {"name": "quality_review", "description": "Review code quality and test coverage", "role": "reviewer", "depends_on": ["write_integration_tests"], "priority": "P2"}, {"name": "final_regression", "description": "Run full regression baseline", "role": "developer", "depends_on": ["quality_review"], "priority": "P1"}]
-Roles: [{"type": "developer", "name": "pm-developer", "capabilities": ["code", "test"]}, {"type": "reviewer", "name": "pm-reviewer", "capabilities": ["review", "quality"]}]
-
-
-Output a JSON object with 'task_graph' containing 'tasks' (list with name, description, role, priority, depends_on) and 'execution_waves'.
+开发一个完整的电商系统
 
 ## 分析要求
 请从以下维度分析任务，并以 JSON 格式输出：

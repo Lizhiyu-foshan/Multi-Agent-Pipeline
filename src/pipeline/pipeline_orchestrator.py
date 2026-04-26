@@ -946,7 +946,7 @@ class PipelineOrchestrator:
                         retry_count=task.retry_count,
                     )
 
-        task_stats = self.scheduler.task_queue.get_statistics()
+        task_stats = self._pipeline_task_stats(pipeline.id)
         pending = task_stats.get("pending", 0)
         processing = task_stats.get("processing", 0)
 
@@ -1097,6 +1097,11 @@ class PipelineOrchestrator:
                     context=context,
                     max_rounds=loop_config.max_iterations,
                 )
+                session.context["_expected_pipeline_id"] = pipeline.id
+                session.context["expected_round"] = session.round_number
+                session.context["_sessions_state_dir"] = str(
+                    Path(self.state_dir) / "sessions"
+                )
                 sid = self.session_manager.save(session)
                 return {
                     "action": "model_request",
@@ -1171,6 +1176,11 @@ class PipelineOrchestrator:
                     context={**context, **loop_state.context},
                     loop_state=loop_state.to_dict(),
                     max_rounds=loop_config.max_iterations,
+                )
+                session.context["_expected_pipeline_id"] = pipeline.id
+                session.context["expected_round"] = session.round_number
+                session.context["_sessions_state_dir"] = str(
+                    Path(self.state_dir) / "sessions"
                 )
                 sid = self.session_manager.save(session)
                 return {
@@ -1333,7 +1343,7 @@ class PipelineOrchestrator:
                 },
             )
 
-        task_stats = self.scheduler.task_queue.get_statistics()
+        task_stats = self._pipeline_task_stats(pipeline.id)
         pending = task_stats.get("pending", 0)
         processing = task_stats.get("processing", 0)
 
@@ -1467,7 +1477,7 @@ class PipelineOrchestrator:
             else:
                 logger.warning(f"Subagent task {proc['task_id']} failed")
 
-        task_stats = self.scheduler.task_queue.get_statistics()
+        task_stats = self._pipeline_task_stats(pipeline.id)
         pending = task_stats.get("pending", 0)
         processing = task_stats.get("processing", 0)
 
@@ -1976,16 +1986,86 @@ class PipelineOrchestrator:
         2. Simple skill resume: session has no active loop_state
            → call skill.continue_execution, handle result
         """
-        session = self.session_manager.load(session_id)
+        wait_started_at = time.time()
+        session, diag = self.session_manager.load_with_diagnostics(session_id)
         if not session:
-            return {"error": f"Session {session_id} not found or expired"}
+            failure = (diag or {}).get("failure", {})
+            error_code = failure.get("code", "SESSION_NOT_FOUND")
+            diagnostic = {
+                "who_waits": "pipeline_orchestrator.resume_model_request",
+                "wait_for": "model_response",
+                "wait_seconds": round(time.time() - wait_started_at, 3),
+                "failure_point": error_code,
+                "session_id": session_id,
+                "detail": failure,
+            }
+            logger.warning(f"model_response resume failed: {diagnostic}")
+            return {
+                "error": f"Session {session_id} not found or expired",
+                "error_code": error_code,
+                "diagnostic": diagnostic,
+            }
 
         self.session_manager.touch(session_id)
 
         pipeline = self.pipelines.get(session.pipeline_id)
         if not pipeline:
             self.session_manager.remove(session_id)
-            return {"error": f"Pipeline {session.pipeline_id} not found"}
+            diagnostic = {
+                "who_waits": "pipeline_orchestrator.resume_model_request",
+                "wait_for": "pipeline",
+                "wait_seconds": round(time.time() - wait_started_at, 3),
+                "failure_point": "PIPELINE_NOT_FOUND",
+                "session_id": session_id,
+                "pipeline_id": session.pipeline_id,
+            }
+            logger.warning(f"model_response resume failed: {diagnostic}")
+            return {
+                "error": f"Pipeline {session.pipeline_id} not found",
+                "error_code": "PIPELINE_NOT_FOUND",
+                "diagnostic": diagnostic,
+            }
+
+        expected_pipeline_id = str(session.context.get("_expected_pipeline_id", "")).strip()
+        if expected_pipeline_id and expected_pipeline_id != session.pipeline_id:
+            self.session_manager.remove(session_id)
+            diagnostic = {
+                "who_waits": "pipeline_orchestrator.resume_model_request",
+                "wait_for": "pipeline_id_match",
+                "wait_seconds": round(time.time() - wait_started_at, 3),
+                "failure_point": "SESSION_PIPELINE_MISMATCH",
+                "session_id": session_id,
+                "expected_pipeline_id": expected_pipeline_id,
+                "actual_pipeline_id": session.pipeline_id,
+            }
+            logger.warning(f"model_response resume failed: {diagnostic}")
+            return {
+                "error": "Session pipeline mismatch",
+                "error_code": "SESSION_PIPELINE_MISMATCH",
+                "diagnostic": diagnostic,
+            }
+
+        expected_round = session.context.get("expected_round")
+        if expected_round is not None:
+            try:
+                if int(expected_round) != int(session.round_number):
+                    diagnostic = {
+                        "who_waits": "pipeline_orchestrator.resume_model_request",
+                        "wait_for": "round_match",
+                        "wait_seconds": round(time.time() - wait_started_at, 3),
+                        "failure_point": "SESSION_ROUND_MISMATCH",
+                        "session_id": session_id,
+                        "expected_round": int(expected_round),
+                        "actual_round": int(session.round_number),
+                    }
+                    logger.warning(f"model_response resume failed: {diagnostic}")
+                    return {
+                        "error": "Session round mismatch",
+                        "error_code": "SESSION_ROUND_MISMATCH",
+                        "diagnostic": diagnostic,
+                    }
+            except Exception:
+                pass
 
         if session.round_number >= session.max_rounds:
             self.session_manager.remove(session_id)
@@ -2040,6 +2120,11 @@ class PipelineOrchestrator:
                 max_rounds=session.max_rounds,
             )
             new_session.round_number = session.round_number + 1
+            new_session.context["_expected_pipeline_id"] = session.pipeline_id
+            new_session.context["expected_round"] = new_session.round_number
+            new_session.context["_sessions_state_dir"] = str(
+                Path(self.state_dir) / "sessions"
+            )
             new_sid = self.session_manager.save(new_session)
             self.session_manager.remove(session_id)
 
@@ -2139,6 +2224,11 @@ class PipelineOrchestrator:
                     max_rounds=session.max_rounds,
                 )
                 new_session.round_number = session.round_number + 1
+                new_session.context["_expected_pipeline_id"] = pipeline.id
+                new_session.context["expected_round"] = new_session.round_number
+                new_session.context["_sessions_state_dir"] = str(
+                    Path(self.state_dir) / "sessions"
+                )
                 new_sid = self.session_manager.save(new_session)
                 self.session_manager.remove(session_id)
                 return {
@@ -2345,6 +2435,8 @@ class PipelineOrchestrator:
             "analyst": "bmad-evo",
             "architect": "bmad-evo",
             "developer": "superpowers",
+            "reviewer": "superpowers",
+            "qa": "superpowers",
             "coder": "superpowers",
             "implementer": "superpowers",
             "tester": "superpowers",
@@ -2376,6 +2468,15 @@ class PipelineOrchestrator:
                 "prompt": str(result.get("output") or result.get("prompt") or ""),
             }
         return {}
+
+    def _pipeline_task_stats(self, pipeline_id: str) -> Dict[str, int]:
+        """Return task statistics scoped to one pipeline."""
+        stats = {"pending": 0, "processing": 0, "completed": 0, "failed": 0}
+        for task in self.scheduler.task_queue.get_by_pipeline(pipeline_id):
+            status = getattr(task, "status", "")
+            if status:
+                stats[status] = stats.get(status, 0) + 1
+        return stats
 
     # ===== Utilities =====
 

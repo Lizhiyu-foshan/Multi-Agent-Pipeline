@@ -134,8 +134,48 @@ class DeliveryManager:
 
         from .gates import GateEvaluator
 
+        gate_ctx = dict(ctx)
+
+        should_run_change_control = not bool(ctx.get("skip_change_control", False))
+        if should_run_change_control:
+            from .change_control import ChangeControlManager
+
+            cc = ChangeControlManager(state_dir=self._state_dir)
+
+            if "risk_result" not in gate_ctx:
+                drift_severity = str(ctx.get("drift_severity", "")).strip().lower()
+                drift_result = ctx.get("drift_result")
+                if drift_result and not drift_severity:
+                    drift_severity = str(
+                        drift_result.get("artifacts", {}).get("severity", "")
+                    ).strip().lower()
+
+                risk_result = cc.assess_risk(
+                    delivery.project_id,
+                    {
+                        "files": list(delivery.files),
+                        "drift_severity": drift_severity,
+                    },
+                )
+                gate_ctx["risk_result"] = risk_result
+
+            if "contamination_result" not in gate_ctx:
+                source_path = str(
+                    ctx.get("source_path")
+                    or delivery.metadata.get("source_dir", "")
+                ).strip()
+                contamination_result = cc.assess_contamination(
+                    delivery.project_id,
+                    {
+                        "files": list(delivery.files),
+                        "source_path": source_path,
+                        "file_contents": dict(ctx.get("file_contents", {})),
+                    },
+                )
+                gate_ctx["contamination_result"] = contamination_result
+
         evaluator = GateEvaluator(state_dir=self._state_dir)
-        gate_result = evaluator.evaluate(delivery.project_id, ctx)
+        gate_result = evaluator.evaluate(delivery.project_id, gate_ctx)
         gate_artifacts = gate_result.get("artifacts", {})
 
         if gate_artifacts.get("decision") == "pass":
@@ -145,13 +185,26 @@ class DeliveryManager:
             return {
                 "success": True,
                 "action": "deliver_gate_passed",
-                "artifacts": {**delivery.to_dict(), "gate": gate_artifacts},
+                "artifacts": {
+                    **delivery.to_dict(),
+                    "gate": gate_artifacts,
+                    "change_control": {
+                        "risk": gate_ctx.get("risk_result", {}),
+                        "contamination": gate_ctx.get("contamination_result", {}),
+                    },
+                },
             }
         else:
             return {
                 "success": False,
                 "action": "deliver_gate_blocked",
-                "artifacts": {"gate": gate_artifacts},
+                "artifacts": {
+                    "gate": gate_artifacts,
+                    "change_control": {
+                        "risk": gate_ctx.get("risk_result", {}),
+                        "contamination": gate_ctx.get("contamination_result", {}),
+                    },
+                },
             }
 
     def _request_approval(self, ctx: Dict[str, Any]) -> Dict[str, Any]:

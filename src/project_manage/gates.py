@@ -28,6 +28,14 @@ class GateEvaluator:
         drift_pass = self._check_drift(project_id, ctx)
         quality_pass = self._check_quality(ctx)
         compat_pass = self._check_compat(ctx)
+        risk_info = self._check_risk(ctx)
+        contamination_info = self._check_contamination(ctx)
+
+        baseline_pass = (
+            baseline_pass
+            and risk_info["pass"]
+            and contamination_info["pass"]
+        )
 
         has_critical_drift = ctx.get("drift_severity") == DriftSeverity.CRITICAL.value
         if has_critical_drift:
@@ -48,6 +56,8 @@ class GateEvaluator:
                 },
                 "quality": {"pass": quality_pass},
                 "compat": {"pass": compat_pass},
+                "risk": risk_info,
+                "contamination": contamination_info,
             },
         )
 
@@ -82,3 +92,47 @@ class GateEvaluator:
         if "compat_pass" in ctx:
             return bool(ctx["compat_pass"])
         return True
+
+    def _check_risk(self, ctx: Dict[str, Any]) -> Dict[str, Any]:
+        allow_high_risk = bool(ctx.get("allow_high_risk", False))
+        risk_level = str(ctx.get("risk_level", "")).strip().lower()
+
+        risk_result = ctx.get("risk_result")
+        if risk_result is not None:
+            artifacts = risk_result.get("artifacts", {})
+            risk_level = str(artifacts.get("level", risk_level)).strip().lower()
+
+        if not risk_level:
+            risk_level = "none"
+
+        passed = risk_level in ("none", "low", "medium") or allow_high_risk
+        return {
+            "pass": passed,
+            "level": risk_level,
+            "allow_high_risk": allow_high_risk,
+        }
+
+    def _check_contamination(self, ctx: Dict[str, Any]) -> Dict[str, Any]:
+        contam_status = str(ctx.get("contamination_status", "")).strip().lower()
+        top_severity = str(ctx.get("contamination_top_severity", "")).strip().lower()
+
+        contamination_result = ctx.get("contamination_result")
+        if contamination_result is not None:
+            artifacts = contamination_result.get("artifacts", {})
+            contam_status = str(artifacts.get("status", contam_status)).strip().lower()
+            top_severity = str(artifacts.get("top_severity", top_severity)).strip().lower()
+
+        if not contam_status and top_severity:
+            contam_status = "pass" if top_severity in ("none", "low") else "blocked"
+
+        if not contam_status:
+            contam_status = "pass"
+        if not top_severity:
+            top_severity = "none"
+
+        passed = contam_status == "pass" and top_severity in ("none", "low")
+        return {
+            "pass": passed,
+            "status": contam_status,
+            "top_severity": top_severity,
+        }

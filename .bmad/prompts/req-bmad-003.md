@@ -1,16 +1,16 @@
-# Model Request: bmad-001
+# Model Request: bmad-003
 
 **Caller**: ModelBridge
 **Model**: glm-4.7
 **Type**: model_inference
-**Created**: 2026-04-25T23:47:14.692227
+**Created**: 2026-04-20T22:43:54.307144
 
 ## Prompt
 
 你是一个智能任务分析专家。请分析以下任务，并提供结构化的分析结果。
 
 ## 任务描述
-
+开发一个完整的电商系统
 
 ## 分析要求
 请从以下维度分析任务，并以 JSON 格式输出：
@@ -49,5 +49,5 @@
 
 1. Read and understand the prompt above
 2. Execute model inference using your capabilities
-3. Write the response to `.bmad/prompts/res-bmad-001.md`
+3. Write the response to `.bmad/prompts/res-bmad-003.md`
 4. Call the adapter again with `context.model_response = <your response>`

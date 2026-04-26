@@ -37,9 +37,16 @@ venv.bak/
 Thumbs.db
 
 .pipeline/
+.pipeline_session/
 .hashline_backups/
+.pytest_cache/
+.ruff_cache/
+__test_ckpt*/
 *.tmp
 *.bak
 
 *.log
 *.log.*
+
+_clones/
+projects/

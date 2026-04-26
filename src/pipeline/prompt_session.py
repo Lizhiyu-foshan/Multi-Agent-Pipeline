@@ -145,6 +145,7 @@ class SessionManager:
     def __init__(self, state_dir: str = None, pipeline_state_fn: Callable = None):
         self._sessions: Dict[str, PromptPassingSession] = {}
         self._pipeline_sessions: Dict[str, str] = {}
+        self._last_failure: Dict[str, Dict[str, Any]] = {}
         self._lock = threading.RLock()
         self._state_dir = state_dir
         self._pipeline_state_fn = pipeline_state_fn
@@ -154,7 +155,35 @@ class SessionManager:
 
     def save(self, session: PromptPassingSession) -> str:
         with self._lock:
+            expected_dir = str(session.context.get("_sessions_state_dir", "")).strip()
+            if expected_dir:
+                expected_norm = os.path.abspath(expected_dir)
+                current_norm = os.path.abspath(str(self._state_dir or ""))
+                if expected_norm != current_norm:
+                    self._last_failure[session.session_id] = {
+                        "code": "SESSION_STATE_DIR_MISMATCH",
+                        "message": "session directory mismatch",
+                        "expected": expected_norm,
+                        "actual": current_norm,
+                        "timestamp": datetime.now().isoformat(),
+                    }
+                    raise ValueError(
+                        f"Session state dir mismatch: expected={expected_norm} actual={current_norm}"
+                    )
+
             session.last_active_at = datetime.now()
+
+            old_sid = self._pipeline_sessions.get(session.pipeline_id)
+            if old_sid and old_sid != session.session_id:
+                self._last_failure[old_sid] = {
+                    "code": "SESSION_SUPERSEDED",
+                    "message": "session superseded by newer pipeline session",
+                    "pipeline_id": session.pipeline_id,
+                    "new_session_id": session.session_id,
+                    "timestamp": datetime.now().isoformat(),
+                }
+                self.remove(old_sid)
+
             self._sessions[session.session_id] = session
             if session.pipeline_id:
                 self._pipeline_sessions[session.pipeline_id] = session.session_id
@@ -165,29 +194,68 @@ class SessionManager:
             return session.session_id
 
     def load(self, session_id: str) -> Optional[PromptPassingSession]:
+        session, _ = self.load_with_diagnostics(session_id)
+        return session
+
+    def load_with_diagnostics(
+        self, session_id: str
+    ) -> Tuple[Optional[PromptPassingSession], Dict[str, Any]]:
         with self._lock:
             session = self._sessions.get(session_id)
             if not session:
-                return None
+                failure = self._last_failure.get(session_id)
+                if failure:
+                    return None, {"status": "missing", "failure": dict(failure)}
+                return None, {
+                    "status": "missing",
+                    "failure": {
+                        "code": "SESSION_NOT_FOUND",
+                        "message": "session not found",
+                    },
+                }
             if session.is_expired:
                 if session.is_dead:
                     logger.warning(f"Session {session_id} dead (max live exceeded)")
+                    self._last_failure[session_id] = {
+                        "code": "SESSION_DEAD",
+                        "message": "session exceeded max live time",
+                        "pipeline_id": session.pipeline_id,
+                        "last_active_at": session.last_active_at.isoformat()
+                        if session.last_active_at
+                        else None,
+                        "timestamp": datetime.now().isoformat(),
+                    }
                     self.remove(session_id)
-                    return None
+                    return None, {
+                        "status": "dead",
+                        "failure": dict(self._last_failure[session_id]),
+                    }
                 if self._is_pipeline_running(session.pipeline_id):
                     session.last_active_at = datetime.now()
                     self._persist_to_disk(session)
                     logger.info(
                         f"Session {session_id} auto-renewed for running pipeline"
                     )
-                    return session
+                    return session, {"status": "ok"}
                 else:
                     logger.warning(
                         f"Session {session_id} expired (pipeline not running)"
                     )
+                    self._last_failure[session_id] = {
+                        "code": "SESSION_EXPIRED",
+                        "message": "session expired while pipeline not running",
+                        "pipeline_id": session.pipeline_id,
+                        "last_active_at": session.last_active_at.isoformat()
+                        if session.last_active_at
+                        else None,
+                        "timestamp": datetime.now().isoformat(),
+                    }
                     self.remove(session_id)
-                    return None
-            return session
+                    return None, {
+                        "status": "expired",
+                        "failure": dict(self._last_failure[session_id]),
+                    }
+            return session, {"status": "ok"}
 
     def load_by_pipeline(self, pipeline_id: str) -> Optional[PromptPassingSession]:
         with self._lock:
@@ -212,6 +280,12 @@ class SessionManager:
             if session:
                 session.completed = True
                 session.last_active_at = datetime.now()
+                self._last_failure[session_id] = {
+                    "code": "SESSION_COMPLETED",
+                    "message": "session already completed",
+                    "pipeline_id": session.pipeline_id,
+                    "timestamp": datetime.now().isoformat(),
+                }
                 self.remove(session_id)
             return session
 
@@ -236,6 +310,11 @@ class SessionManager:
             if session:
                 session.last_active_at = datetime.now()
                 self._persist_to_disk(session)
+
+    def get_last_failure(self, session_id: str) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            failure = self._last_failure.get(session_id)
+            return dict(failure) if failure else None
 
     def _is_pipeline_running(self, pipeline_id: str) -> bool:
         if not pipeline_id:

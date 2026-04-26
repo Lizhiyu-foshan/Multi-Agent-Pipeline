@@ -64,3 +64,51 @@ def test_session_is_dead_uses_created_at_hard_cap():
     sess.created_at = datetime.now() - timedelta(days=2)
     sess.last_active_at = datetime.now()
     assert sess.is_dead is True
+
+
+def test_load_with_diagnostics_for_missing_session(temp_dir):
+    sm = SessionManager(state_dir=temp_dir)
+    session, diag = sm.load_with_diagnostics("sess_missing")
+    assert session is None
+    assert diag["status"] == "missing"
+    assert diag["failure"]["code"] == "SESSION_NOT_FOUND"
+
+
+def test_single_active_session_per_pipeline_supersedes_old(temp_dir):
+    sm = SessionManager(state_dir=temp_dir)
+    s1 = PromptPassingSession(
+        session_id="sess_old",
+        pipeline_id="pipe_same",
+        task_id="task_1",
+        skill_name="s",
+    )
+    s2 = PromptPassingSession(
+        session_id="sess_new",
+        pipeline_id="pipe_same",
+        task_id="task_2",
+        skill_name="s",
+    )
+
+    sm.save(s1)
+    sm.save(s2)
+
+    assert sm.load("sess_old") is None
+    assert sm.load("sess_new") is not None
+
+    failure = sm.get_last_failure("sess_old")
+    assert failure is not None
+    assert failure["code"] == "SESSION_SUPERSEDED"
+
+
+def test_save_rejects_state_dir_mismatch(temp_dir):
+    sm = SessionManager(state_dir=temp_dir)
+    sess = PromptPassingSession(
+        session_id="sess_mismatch",
+        pipeline_id="pipe_1",
+        task_id="task_1",
+        skill_name="s",
+        context={"_sessions_state_dir": str(Path(temp_dir) / "other_sessions")},
+    )
+
+    with pytest.raises(ValueError, match="Session state dir mismatch"):
+        sm.save(sess)

@@ -1,0 +1,17 @@
+{
+  "commands": [
+    {
+      "name": "map",
+      "description": "MAP engine and project commands",
+      "run": "python scripts/map_command_proxy.py {args}",
+      "examples": [
+        "/map /?",
+        "/map p /?",
+        "/map doc /?",
+        "/map p init demo --path D:\\demo",
+        "/map p demo",
+        "/map status"
+      ]
+    }
+  ]
+}

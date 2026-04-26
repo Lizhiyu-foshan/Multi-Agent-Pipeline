@@ -60,7 +60,10 @@ from .intent_gate import (
 )
 from .pipeline_watchdog import PipelineWatchdog, WatchdogConfig, HealthStatus
 from .metrics import PipelineMetrics
-
+from .cooling_system import CoolingSystem, CoolingConfig, CoolingLevel, CoolingState
+from .brake_system import BrakeSystem, BrakeLevel, BrakeState
+from .transmission import TransmissionBridge, TransmissionOutput, ProjectProfile
+from .engine_controller import EngineController, EngineState, IgnitionResult, EngineReport
 try:
     from .worktree_manager import WorktreeManager
 except ImportError:
@@ -133,4 +136,18 @@ __all__ = [
     "WatchdogConfig",
     "HealthStatus",
     "PipelineMetrics",
+    "CoolingSystem",
+    "CoolingConfig",
+    "CoolingLevel",
+    "CoolingState",
+    "BrakeSystem",
+    "BrakeLevel",
+    "BrakeState",
+    "TransmissionBridge",
+    "TransmissionOutput",
+    "ProjectProfile",
+    "EngineController",
+    "EngineState",
+    "IgnitionResult",
+    "EngineReport",
 ]
